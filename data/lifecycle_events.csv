@@ -1,0 +1,26 @@
+plant_id,event_type,event_month,health_after,health_boost,notes
+PLANT_001,REPAIR,2021-07,0.99,0.321,Scheduled maintenance
+PLANT_005,REPAIR,2025-03,0.79,0.169,Scheduled maintenance
+PLANT_010,REPAIR,2024-01,0.747,0.196,Scheduled maintenance
+PLANT_012,REPAIR,2024-08,0.87,0.272,Scheduled maintenance
+PLANT_013,REPAIR,2024-04,0.935,0.239,Scheduled maintenance
+PLANT_018,REPAIR,2024-02,0.806,0.221,Scheduled maintenance
+PLANT_019,REPAIR,2024-06,0.713,0.204,Scheduled maintenance
+PLANT_020,REPAIR,2024-04,0.846,0.245,Scheduled maintenance
+PLANT_021,REPAIR,2021-11,0.841,0.171,Scheduled maintenance
+PLANT_025,REPAIR,2023-03,0.887,0.254,Scheduled maintenance
+PLANT_026,REPAIR,2022-11,0.923,0.258,Scheduled maintenance
+PLANT_027,REPAIR,2025-01,0.975,0.324,Scheduled maintenance
+PLANT_029,REPAIR,2022-09,0.899,0.312,Scheduled maintenance
+PLANT_031,REPAIR,2024-05,0.836,0.281,Scheduled maintenance
+PLANT_032,REPAIR,2022-01,0.867,0.25,Scheduled maintenance
+PLANT_032,REPAIR,2025-04,0.959,0.27,Scheduled maintenance
+PLANT_033,REPAIR,2023-02,0.99,0.343,Scheduled maintenance
+PLANT_035,REPAIR,2023-06,0.827,0.186,Scheduled maintenance
+PLANT_036,REPAIR,2025-03,0.858,0.332,Scheduled maintenance
+PLANT_038,REPAIR,2023-03,0.986,0.315,Scheduled maintenance
+PLANT_042,REPAIR,2022-04,0.88,0.199,Scheduled maintenance
+PLANT_043,REPAIR,2022-02,0.989,0.294,Scheduled maintenance
+PLANT_046,REPAIR,2024-01,0.904,0.266,Scheduled maintenance
+PLANT_048,REPAIR,2025-03,0.99,0.313,Scheduled maintenance
+PLANT_049,REPAIR,2023-09,0.99,0.346,Scheduled maintenance

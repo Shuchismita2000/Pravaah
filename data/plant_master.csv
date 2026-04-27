@@ -1,0 +1,51 @@
+plant_id,plant_name,plant_type,capacity_mw,latitude,longitude,commission_date,region,state,developer,offtaker
+PLANT_001,Koppal Solar,Solar,102,17.2093,79.8116,2015-11-17,Kalyana Karnataka,Karnataka,ReNew Power,HESCOM
+PLANT_002,Raichur Wind,Wind,129,17.777,78.2008,2019-07-08,Kalyana Karnataka,Karnataka,Greenko,HESCOM
+PLANT_003,Gadag Renewables,Hybrid,69,15.6058,76.6152,2023-09-25,North Karnataka,Karnataka,Greenko,GESCOM
+PLANT_004,Bidar Solar,Solar,142,15.5149,75.0584,2021-06-05,Kalyana Karnataka,Karnataka,SECI,HESCOM
+PLANT_005,Ballari Wind,Wind,94,14.1991,77.8031,2018-03-17,Kalyana Karnataka,Karnataka,Greenko,HESCOM
+PLANT_006,Tumakuru Solar,Solar,20,14.7819,76.1444,2018-02-05,Central Karnataka,Karnataka,SECI,HESCOM
+PLANT_007,Chitradurga Wind,Wind,107,15.8901,76.0705,2022-09-06,Central Karnataka,Karnataka,SECI,BESCOM
+PLANT_008,Davangere Solar,Solar,38,17.3074,76.7627,2023-02-10,Central Karnataka,Karnataka,KSPDCL,CESC
+PLANT_009,Shivamogga Hydra,Hybrid,104,16.0261,75.8947,2022-05-18,Central Karnataka,Karnataka,SECI,BESCOM
+PLANT_010,Hassan Solar,Solar,155,14.3717,75.1067,2015-11-11,South Karnataka,Karnataka,KREDL,CESC
+PLANT_011,Belagavi Wind,Wind,112,16.4864,78.7742,2022-09-08,North Karnataka,Karnataka,ReNew Power,HESCOM
+PLANT_012,Dharwad Solar,Solar,111,17.5702,75.5234,2017-04-08,North Karnataka,Karnataka,NTPC,BESCOM
+PLANT_013,Haveri Green,Hybrid,140,15.5122,76.0652,2018-10-20,North Karnataka,Karnataka,Greenko,CESC
+PLANT_014,Bagalkot Solar,Solar,89,15.4327,76.6711,2016-10-15,North Karnataka,Karnataka,ReNew Power,BESCOM
+PLANT_015,Vijayapura Wind,Wind,114,17.3426,76.1374,2019-05-23,Kalyana Karnataka,Karnataka,NTPC,BESCOM
+PLANT_016,Kalaburagi Solar,Solar,20,17.9387,78.1838,2017-10-12,Kalyana Karnataka,Karnataka,Greenko,GESCOM
+PLANT_017,Yadgir Wind,Wind,91,14.0965,75.221,2017-08-04,Kalyana Karnataka,Karnataka,Adani Green,MESCOM
+PLANT_018,Chamarajanagar Solar,Solar,117,16.2236,76.2581,2016-03-11,South Karnataka,Karnataka,NTPC,HESCOM
+PLANT_019,Mandya Renewables,Hybrid,54,17.704,79.7743,2015-05-13,South Karnataka,Karnataka,KSPDCL,CESC
+PLANT_020,Mysuru Solar,Solar,175,14.6732,76.3362,2017-02-01,South Karnataka,Karnataka,Greenko,HESCOM
+PLANT_021,Kodagu Wind,Wind,125,16.1151,79.9813,2015-09-08,South Karnataka,Karnataka,KSPDCL,MESCOM
+PLANT_022,Udupi Coastal Solar,Solar,124,16.0497,78.3425,2023-02-09,Coastal Karnataka,Karnataka,ReNew Power,HESCOM
+PLANT_023,Dakshina Kannada Wind,Wind,95,14.7309,79.8154,2020-01-04,Coastal Karnataka,Karnataka,Greenko,BESCOM
+PLANT_024,Uttara Kannada Solar,Solar,65,14.3556,75.6341,2020-05-23,Coastal Karnataka,Karnataka,Greenko,HESCOM
+PLANT_025,Chikkamagaluru Wind,Wind,119,15.3263,75.5017,2016-07-27,South Karnataka,Karnataka,Adani Green,HESCOM
+PLANT_026,Bengaluru Rural Solar,Solar,38,16.9905,76.7013,2016-08-23,South Karnataka,Karnataka,ReNew Power,MESCOM
+PLANT_027,Kolar Wind,Wind,103,15.0858,77.6732,2018-10-22,South Karnataka,Karnataka,Greenko,BESCOM
+PLANT_028,Chikkaballapura Solar,Solar,167,17.9682,79.9725,2022-09-10,South Karnataka,Karnataka,KSPDCL,BESCOM
+PLANT_029,Tumkur North Wind,Wind,124,17.6285,79.6468,2015-02-08,Central Karnataka,Karnataka,Greenko,BESCOM
+PLANT_030,Ramanagara Solar,Solar,43,13.5417,75.8601,2020-08-16,South Karnataka,Karnataka,SECI,BESCOM
+PLANT_031,Haveri West Wind,Wind,124,13.67,79.2778,2016-03-08,North Karnataka,Karnataka,SECI,GESCOM
+PLANT_032,Dharwad East Solar,Solar,20,14.6635,76.2277,2015-01-20,North Karnataka,Karnataka,ReNew Power,HESCOM
+PLANT_033,Gadag North Wind,Wind,93,15.2034,78.0372,2017-04-17,North Karnataka,Karnataka,ReNew Power,CESC
+PLANT_034,Koppal East Solar,Solar,46,13.8437,79.8394,2023-09-08,Kalyana Karnataka,Karnataka,SECI,HESCOM
+PLANT_035,Ron Solar,Solar,109,15.2994,78.0876,2016-10-22,North Karnataka,Karnataka,NTPC,MESCOM
+PLANT_036,Nargund Wind,Wind,101,17.9543,78.1088,2016-06-27,North Karnataka,Karnataka,SECI,HESCOM
+PLANT_037,Shirahatti Solar,Solar,73,13.59,78.8082,2023-04-05,North Karnataka,Karnataka,ReNew Power,GESCOM
+PLANT_038,Laxmeshwar Wind,Wind,144,14.6384,75.876,2017-04-15,North Karnataka,Karnataka,KREDL,MESCOM
+PLANT_039,Mundargi Solar,Solar,69,17.2563,78.5468,2017-09-04,North Karnataka,Karnataka,SECI,BESCOM
+PLANT_040,Shiggaon Wind,Wind,107,14.869,79.2548,2020-09-12,North Karnataka,Karnataka,ReNew Power,CESC
+PLANT_041,Ranibennur Solar,Solar,97,15.4281,79.977,2019-07-24,North Karnataka,Karnataka,Greenko,HESCOM
+PLANT_042,Hirekerur Wind,Wind,111,15.1609,76.0993,2016-06-11,North Karnataka,Karnataka,SECI,GESCOM
+PLANT_043,Savanur Solar,Solar,137,17.4703,78.8575,2016-05-03,North Karnataka,Karnataka,Adani Green,MESCOM
+PLANT_044,Byadagi Wind,Wind,38,17.0244,79.549,2018-07-11,North Karnataka,Karnataka,NTPC,BESCOM
+PLANT_045,Hangal Solar,Solar,46,16.888,77.3967,2023-02-09,North Karnataka,Karnataka,KREDL,MESCOM
+PLANT_046,Kundagol Wind,Wind,114,13.8925,79.1559,2017-04-22,North Karnataka,Karnataka,KSPDCL,CESC
+PLANT_047,Navalgund Solar,Solar,101,13.6942,78.6408,2019-03-27,North Karnataka,Karnataka,KREDL,CESC
+PLANT_048,Annigeri Wind,Wind,49,14.0255,75.1517,2019-03-12,North Karnataka,Karnataka,Adani Green,HESCOM
+PLANT_049,Kalaghatgi Solar,Solar,62,17.3566,76.4547,2018-02-03,North Karnataka,Karnataka,SECI,GESCOM
+PLANT_050,Hubli North Wind,Wind,53,16.7841,77.2923,2023-01-20,North Karnataka,Karnataka,NTPC,GESCOM
