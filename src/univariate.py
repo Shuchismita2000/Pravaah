@@ -270,7 +270,6 @@ def fit_lstm(
 def select_best_univariate_model(
     series: pd.Series,
     plant_id: str,
-    plant_type: str,
     horizon: int = 72,
     val_hours: int = 168,
 ) -> dict:
@@ -283,7 +282,6 @@ def select_best_univariate_model(
     ----------
     series     : hourly generation series with DatetimeIndex
     plant_id   : for logging
-    plant_type : "Solar" | "Wind" | "Hybrid"
     horizon    : forecast hours (default 72)
     val_hours  : validation window size (default 168 = 7 days)
 
@@ -354,7 +352,6 @@ def select_best_univariate_model(
 
     return {
         "plant_id":            plant_id,
-        "plant_type":          plant_type,
         "best_model":          best_name,
         "diagnostics":         diag,
         "validation_scores":   {m: r["scores"] for m, r in results.items()},
@@ -369,84 +366,113 @@ def select_best_univariate_model(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_univariate_fleet(
-    generation_df: pd.DataFrame,
-    plant_master_df: pd.DataFrame,
+    fleet_df: pd.DataFrame,          # ← your feature-engineered dataframe, all plants
     horizon: int = 72,
-    output_path: str = "data/univariate_forecasts.parquet",
+    output_path: str = "data/forecasts/univariate_forecasts.csv",
 ) -> pd.DataFrame:
     """
-    Runs select_best_univariate_model() for every plant.
-    Saves a long-format parquet with columns:
-        plant_id | timestamp | forecast_mw | model_used
+    Parameters
+    ----------
+    fleet_df : pd.DataFrame
+        Pre-processed, feature-selected dataframe containing ALL plants.
+        Required columns:
+            - plant_id        : str
+            - timestamp       : datetime
+            - generation      : float  (actual_generation_mw, already aliased by preprocess())
+        All other feature columns are carried through automatically.
 
-    This output is the input to your multivariate FE pipeline as
-    the 'generation' lag/rolling features for the forecast window.
-
-    Usage
-    -----
-    gen = pd.read_csv("data/generation_raw.csv", parse_dates=["timestamp"])
-    pm  = pd.read_csv("data/plant_master.csv")
-    forecast_df = run_univariate_fleet(gen, pm)
+    Why per-plant DataFrame instead of CSV:
+        - You've already run preprocess() + build_features() + reduction pipeline
+        - No re-reading, no re-joining, no re-cleaning
+        - Capacity_mw are already correct in the dataframe
     """
-    gen_df = generation_df.copy()
-    gen_df["timestamp"] = pd.to_datetime(gen_df["timestamp"])
 
-    all_forecasts = []
-    model_selection_log = []
-
-    for _, plant in plant_master_df.iterrows():
-        pid   = plant["plant_id"]
-        ptype = plant["plant_type"]
-        print(f"\n{'='*55}")
-        print(f"Plant: {pid} — {plant['plant_name']} ({ptype})")
-        print("="*55)
-
-        plant_gen = (
-            gen_df[gen_df["plant_id"] == pid]
-            .set_index("timestamp")["actual_generation_mw"]
-            .sort_index()
-            .asfreq("h")           # enforce hourly frequency
-            .fillna(method="ffill", limit=3)
-            .fillna(0)
+    # Validate required columns up front — fail early, not mid-loop
+    required = {"plant_id", "timestamp", "generation"}
+    missing = required - set(fleet_df.columns)
+    if missing:
+        raise ValueError(
+            f"fleet_df is missing required columns: {missing}\n"
+            f"Run preprocess() first — it aliases actual_generation_mw → generation."
         )
 
-        if len(plant_gen) < 500:
-            print(f"  [SKIP] insufficient data ({len(plant_gen)} hrs)")
+    fleet_df = fleet_df.copy()
+    fleet_df["timestamp"] = pd.to_datetime(fleet_df["timestamp"])
+
+    all_forecasts = []
+    selection_log = []
+    failed_plants = []
+
+    # Group by plant_id — each group IS the per-plant feature dataframe
+    for plant_id, plant_df in fleet_df.groupby("plant_id"):
+
+        print(f"\n{'='*55}")
+        print(f"Plant: {plant_id} —({len(plant_df):,} rows, {len(plant_df.columns)} features)")
+        print("="*55)
+
+        # Extract the generation series with DatetimeIndex
+        # This is the ONLY column univariate models need from the feature df
+        try:
+            series = (
+                plant_df
+                .sort_values("timestamp")
+                .set_index("timestamp")["generation"]
+                .asfreq("h")
+                .ffill(limit=3)
+                .fillna(0)
+            )
+        except Exception as e:
+            print(f"  [SKIP] Could not build series: {e}")
+            failed_plants.append({"plant_id": plant_id, "error": str(e)})
+            continue
+
+        if len(series) < 500:
+            print(f"  [SKIP] Insufficient data ({len(series)} hrs)")
+            failed_plants.append({"plant_id": plant_id, "error": "insufficient data"})
             continue
 
         try:
-            result = select_best_univariate_model(
-                plant_gen, pid, ptype, horizon=horizon
-            )
-            # Long format forecast rows
-            for ts, mw in zip(result["forecast_timestamps"], result["forecast_72h"]):
-                all_forecasts.append({
-                    "plant_id":    pid,
-                    "timestamp":   ts,
-                    "forecast_mw": round(float(mw), 3),
-                    "model_used":  result["best_model"],
-                })
-            model_selection_log.append({
-                "plant_id":   pid,
-                "plant_type": ptype,
-                "best_model": result["best_model"],
-                **{f"{m}_MAE": v["MAE"] for m, v in result["validation_scores"].items()},
-            })
+            result = select_best_univariate_model(series, plant_id, horizon=horizon)
+
+            all_forecasts.append(result["forecast_df"])
+
+            log_row = {
+                "plant_id":       plant_id,
+                "n_features":     len(plant_df.columns),   # ← now tracked
+                "n_obs":          result["diagnostics"]["n_obs"],
+                "zero_rate":      result["diagnostics"]["zero_rate"],
+                "cv":             result["diagnostics"]["cv"],
+                "best_model":     result["best_model"],
+            }
+            for model_name, sc in result["all_scores"].items():
+                log_row[f"{model_name}_MAE"]  = sc["MAE"]
+                log_row[f"{model_name}_RMSE"] = sc["RMSE"]
+                log_row[f"{model_name}_MAPE"] = sc["MAPE"]
+
+            selection_log.append(log_row)
 
         except Exception as e:
-            print(f"  [ERROR] {pid}: {e}")
+            print(f"\n  [ERROR] {plant_id}: {e}")
+            failed_plants.append({"plant_id": plant_id, "error": str(e)})
 
-    forecast_df = pd.DataFrame(all_forecasts)
+    # Save outputs
+    forecast_df = pd.concat(all_forecasts, ignore_index=True)
+    log_df      = pd.DataFrame(selection_log)
+
     forecast_df.to_parquet(output_path, index=False)
+    log_df.to_csv("data/forecasts/model_selection_log.csv", index=False)
 
-    log_df = pd.DataFrame(model_selection_log)
-    log_df.to_csv("data/model_selection_log.csv", index=False)
+    if failed_plants:
+        pd.DataFrame(failed_plants).to_csv("data/forecasts/failed_plants.csv", index=False)
 
-    print(f"\n{'='*55}")
-    print(f"Fleet univariate forecast complete")
-    print(f"  Plants processed : {log_df.shape[0]}")
-    print(f"  Model distribution:\n{log_df['best_model'].value_counts().to_string()}")
-    print(f"  Saved → {output_path}")
+    print(f"\n{'═'*55}")
+    print(f"  FLEET COMPLETE")
+    print(f"  Plants processed : {len(selection_log)}")
+    print(f"  Plants failed    : {len(failed_plants)}")
+    if len(log_df):
+        print(f"\n  Model distribution:")
+        for model, cnt in log_df["best_model"].value_counts().items():
+            print(f"    {model:10s}: {cnt} plants ({cnt/len(log_df):.0%})")
+    print("="*55)
+
     return forecast_df
-
-    
