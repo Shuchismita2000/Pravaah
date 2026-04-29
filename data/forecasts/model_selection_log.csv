@@ -1,0 +1,2 @@
+plant_id,n_features,n_obs,zero_rate,cv,best_model,sarima_MAE,sarima_RMSE,sarima_MAPE,prophet_MAE,prophet_RMSE,prophet_MAPE,lstm_MAE,lstm_RMSE,lstm_MAPE
+PLANT_001,35,11008,0.75,2.002,sarima,2.178,4.067,22.13,7.302,12.013,61.62,2.749,4.342,42.47
