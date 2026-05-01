@@ -30,6 +30,120 @@ import traceback
 from pathlib import Path
 
 OUT_DIR = Path("data/forecasts")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 0 — Data Pre-processing
+# Important to Run this to make the univariate models work well — they expect clean, regular, gap-free hourly series
+# ══════════════════════════════════════════════════════════════════════════════
+def prepare_univariate_input(
+    df: pd.DataFrame,
+    min_hours: int = 500,
+) -> pd.DataFrame:
+    """
+    Prepares a clean, minimal dataframe for univariate forecasting.
+
+    Input  : df with at minimum — timestamp, plant_id, 
+             plant_type, actual_generation_mw
+    Output : df with timestamp, plant_id, plant_type, generation
+             — sorted, hourly-complete, no gaps, no negatives
+    """
+
+
+    # ── 1. Types ──────────────────────────────────────────────────
+    df['timestamp']     = pd.to_datetime(df['timestamp'])
+    df['actual_generation_mw'] = pd.to_numeric(df['actual_generation_mw'], errors='coerce')
+
+    # ── 2. Rename to match what univariate expects ─────────────────
+    # run_univariate_fleet looks for column named 'generation'
+    df = df.rename(columns={'actual_generation_mw': 'generation'})
+
+    # ── 3. Remove duplicates — keep last (most recent SCADA write) ─
+    before = len(df)
+    df = df.drop_duplicates(subset=['plant_id', 'timestamp'], keep='last')
+    dropped = before - len(df)
+    if dropped:
+        print(f"[Prep] Dropped {dropped:,} duplicate timestamp rows")
+
+    # ── 4. Sort ───────────────────────────────────────────────────
+    df = df.sort_values(['plant_id', 'timestamp']).reset_index(drop=True)
+
+    # ── 5. Per-plant: enforce hourly frequency + fill gaps ─────────
+    # This is the most important step — models break on irregular timestamps
+    parts = []
+    skipped = []
+
+    for plant_id, plant_df in df.groupby('plant_id'):
+
+        plant_type = plant_df['plant_type'].iloc[0]
+
+        series = (
+            plant_df
+            .set_index('timestamp')['generation']
+            .sort_index()
+        )
+
+        # Enforce complete hourly index — no missing hours
+        full_idx = pd.date_range(
+            start = series.index.min(),
+            end   = series.index.max(),
+            freq  = 'h',
+        )
+        series = series.reindex(full_idx)
+
+        n_gaps = series.isna().sum()
+
+        # Fill strategy — same as univariate runner does internally
+        # but doing it here makes gaps visible before modelling
+        series = series.ffill(limit=3).fillna(0)
+
+        if n_gaps:
+            print(f"  [{plant_id}] Filled {n_gaps:,} missing hours "
+                  f"({n_gaps/len(series):.1%} of series)")
+
+        # ── 6. Physical bounds ────────────────────────────────────
+        # Negative generation = sensor error, clip to 0
+        n_neg = (series < 0).sum()
+        if n_neg:
+            print(f"  [{plant_id}] Clipped {n_neg} negative values to 0")
+        series = series.clip(lower=0)
+
+        # ── 7. Skip plants with insufficient data ─────────────────
+        if len(series) < min_hours:
+            print(f"  [{plant_id}] SKIPPED — only {len(series)} hrs "
+                  f"(need {min_hours})")
+            skipped.append(plant_id)
+            continue
+
+        # Rebuild as dataframe
+        plant_out = pd.DataFrame({
+            'timestamp':  series.index,
+            'plant_id':   plant_id,
+            'plant_type': plant_type,
+            'generation': series.values,
+        })
+        parts.append(plant_out)
+
+    # ── 8. Combine ────────────────────────────────────────────────
+    if not parts:
+        raise ValueError("No plants passed the minimum hours filter. "
+                         f"Check min_hours={min_hours} or your data.")
+
+    out = pd.concat(parts, ignore_index=True)
+
+    # ── 9. Summary ────────────────────────────────────────────────
+    print(f"\n[Prep] Ready for univariate forecasting:")
+    print(f"  Plants included : {out['plant_id'].nunique()}")
+    print(f"  Plants skipped  : {len(skipped)}")
+    print(f"  Total rows      : {len(out):,}")
+    print(f"  Columns         : {out.columns.tolist()}")
+    print(f"  Date range      : {out['timestamp'].min()} → {out['timestamp'].max()}")
+    print(f"\n  Rows per plant type:")
+    print(out.groupby('plant_type')['plant_id'].nunique()
+            .rename('plants').to_string())
+
+    return out
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — TIME SERIES DIAGNOSTICS
 # Run this first per plant to understand the series before choosing a model
