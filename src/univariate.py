@@ -383,92 +383,428 @@ def fit_lstm(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — MODEL SELECTION: run all, pick best on validation MAE
+# SECTION 6 — Other Models (ETS, Theta, LightGBM, XGBoost)
+# ETS (Exponential Smoothing, near-instant, good baseline)
+# Theta  (fast classical, strong on energy M3/M4 benchmarks)
+# XGBoost  (alternative to LightGBM, ~15s)
+# LightGBM  (replaces LSTM — 8s vs 12min)
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+try:
+    import lightgbm as lgb
+    HAS_LGBM = True
+except ImportError:
+    HAS_LGBM = False
+    print("[WARN] lightgbm not installed")
+
+try:
+    import xgboost as xgb
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    from statsmodels.tsa.forecasting.theta import ThetaModel
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SHARED UTILITY — lag feature builder for tree models
+# ══════════════════════════════════════════════════════════════════════════
+
+def _build_lag_features(series: pd.Series) -> pd.DataFrame:
+    """
+    Converts a univariate series into a supervised learning dataframe
+    using lag features. This is what makes tree models work for time series.
+
+    Features created:
+      - Lags: t-1, t-2, t-3, t-6, t-12, t-24, t-48, t-168
+      - Rolling: mean/std over 6h, 24h, 168h windows
+      - Time: hour, day_of_week, month, is_weekend, is_daytime
+    """
+    df = pd.DataFrame({"y": series})
+
+    # Lag features — most important for tree models
+    for lag in [1, 2, 3, 6, 12, 24, 48, 168]:
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+
+    # Rolling statistics
+    for window in [6, 24, 168]:
+        df[f"roll_mean_{window}"] = df["y"].shift(1).rolling(window).mean()
+        df[f"roll_std_{window}"]  = df["y"].shift(1).rolling(window).std()
+        df[f"roll_max_{window}"]  = df["y"].shift(1).rolling(window).max()
+
+    # Calendar features from index
+    df["hour"]        = series.index.hour
+    df["day_of_week"] = series.index.dayofweek
+    df["month"]       = series.index.month
+    df["is_weekend"]  = (series.index.dayofweek >= 5).astype(int)
+    df["is_daytime"]  = ((series.index.hour >= 6) & (series.index.hour <= 18)).astype(int)
+
+    # Cyclical encoding — avoids 23→0 discontinuity
+    df["hour_sin"]  = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"]  = np.cos(2 * np.pi * df["hour"] / 24)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+
+    df = df.dropna()
+    return df
+
+
+def _tree_train_predict(
+    series: pd.Series,
+    model_obj,
+    horizon: int,
+) -> np.ndarray:
+    """
+    Trains a tree model (LightGBM or XGBoost) on lag features,
+    then forecasts horizon steps ahead using recursive prediction.
+
+    Recursive strategy: predict t+1, append to series, predict t+2, etc.
+    This is the standard approach for multi-step tree forecasting.
+    """
+    # Build features on full training series
+    feat_df = _build_lag_features(series)
+    feature_cols = [c for c in feat_df.columns if c != "y"]
+
+    X_train = feat_df[feature_cols].values
+    y_train = feat_df["y"].values
+
+    model_obj.fit(X_train, y_train)
+
+    # Recursive multi-step forecast
+    history   = series.copy()
+    forecasts = []
+
+    for step in range(horizon):
+        # Rebuild features on growing history, take last row
+        feat = _build_lag_features(history)
+        if len(feat) == 0:
+            forecasts.append(history.mean())
+            continue
+
+        x_pred = feat[feature_cols].iloc[[-1]].values
+        pred   = float(model_obj.predict(x_pred)[0])
+        pred   = max(0, pred)      # generation >= 0
+        forecasts.append(pred)
+
+        # Append prediction to history for next step
+        next_ts    = history.index[-1] + pd.Timedelta(hours=1)
+        new_point  = pd.Series([pred], index=[next_ts])
+        history    = pd.concat([history, new_point])
+
+    return np.array(forecasts)
+# ══════════════════════════════════════════════════════════════════════════════
+# ETS (Exponential Smoothing, near-instant, good baseline)
+# Theta  (fast classical, strong on energy M3/M4 benchmarks)
+# XGBoost  (alternative to LightGBM, ~15s)
+# LightGBM  (replaces LSTM — 8s vs 12min)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fit_ets(
+    train: pd.Series,
+    horizon: int,
+) -> tuple[object, np.ndarray]:
+    """
+    Holt-Winters Exponential Smoothing with additive trend + seasonality.
+    Fits in < 2s. Strong on data with clear daily pattern.
+    Good replacement for naive baseline.
+    """
+    if not HAS_STATSMODELS:
+        raise ImportError("statsmodels not installed")
+
+    # ETS needs at least 2 full seasonal cycles
+    if len(train) < 48:
+        raise ValueError("ETS needs at least 48 observations (2 × 24h cycles)")
+
+    model = ExponentialSmoothing(
+        train,
+        trend="add",
+        seasonal="add",
+        seasonal_periods=24,    # daily cycle
+        initialization_method="estimated",
+    )
+    fit = model.fit(optimized=True, remove_bias=True)
+    fc  = fit.forecast(horizon)
+    fc  = np.maximum(0, fc.values)
+
+    print(f"    ETS: alpha={fit.params['smoothing_level']:.3f} | "
+          f"forecast range [{fc.min():.1f}, {fc.max():.1f}] MW")
+    return fit, fc
+
+def fit_theta(
+    train: pd.Series,
+    horizon: int,
+) -> tuple[object, np.ndarray]:
+    """
+    Theta method — decomposes series into trend + seasonality.
+    Extremely fast (< 1s), competitive on energy data.
+    Good fallback when SARIMA/Prophet are too slow.
+    """
+    if not HAS_STATSMODELS:
+        raise ImportError("statsmodels not installed")
+
+    # Theta requires positive values — clip zeros to small positive
+    train_pos = train.clip(lower=0.01)
+
+    model = ThetaModel(
+        train_pos,
+        period=24,          # daily seasonality
+        deseasonalize=True,
+        use_test=False,
+    )
+    fit = model.fit(disp=False)
+    fc  = fit.forecast(horizon)
+    fc  = np.maximum(0, fc.values)
+
+    print(f"    Theta: forecast range [{fc.min():.1f}, {fc.max():.1f}] MW")
+    return fit, fc
+
+def fit_xgboost(
+    train: pd.Series,
+    horizon: int,
+) -> tuple[object, np.ndarray]:
+    """
+    XGBoost on lag features. Slightly slower than LightGBM but often
+    more robust on smaller datasets with higher regularisation.
+    """
+    if not HAS_XGB:
+        raise ImportError("xgboost not installed: pip install xgboost")
+
+    feat_df      = _build_lag_features(train)
+    feature_cols = [c for c in feat_df.columns if c != "y"]
+
+    X = feat_df[feature_cols].values
+    y = feat_df["y"].values
+
+    split       = int(len(X) * 0.85)
+    X_tr, X_vl = X[:split], X[split:]
+    y_tr, y_vl = y[:split], y[split:]
+
+    model = xgb.XGBRegressor(
+        n_estimators=500,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=42,
+        verbosity=0,
+        n_jobs=1,
+        early_stopping_rounds=50,
+        eval_metric="mae",
+    )
+    model.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=False)
+
+    fc = _tree_train_predict(train, model, horizon)
+    print(f"    XGBoost: {model.best_iteration} trees | "
+          f"forecast range [{fc.min():.1f}, {fc.max():.1f}] MW")
+    return model, fc
+
+
+def fit_lightgbm(
+    train: pd.Series,
+    horizon: int,
+) -> tuple[object, np.ndarray]:
+    """
+    LightGBM on lag features. Trains in seconds, competitive accuracy.
+
+    Key params:
+      n_estimators=500  — enough trees, early stopping prevents overfit
+      num_leaves=31     — default, good for small-medium datasets
+      learning_rate=0.05 — conservative, more stable than 0.1
+    """
+    if not HAS_LGBM:
+        raise ImportError("lightgbm not installed: pip install lightgbm")
+
+    feat_df      = _build_lag_features(train)
+    feature_cols = [c for c in feat_df.columns if c != "y"]
+
+    X = feat_df[feature_cols].values
+    y = feat_df["y"].values
+
+    # Time-based train/val split for early stopping (no shuffle)
+    split    = int(len(X) * 0.85)
+    X_tr, X_vl = X[:split], X[split:]
+    y_tr, y_vl = y[:split], y[split:]
+
+    model = lgb.LGBMRegressor(
+        n_estimators=500,
+        num_leaves=31,
+        learning_rate=0.05,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=5,
+        min_child_samples=20,
+        reg_alpha=0.1,
+        reg_lambda=0.1,
+        random_state=42,
+        verbosity=-1,
+        n_jobs=1,           # 1 here — parallelism handled at fleet level
+    )
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_vl, y_vl)],
+        callbacks=[lgb.early_stopping(50, verbose=False),
+                   lgb.log_evaluation(period=-1)],
+    )
+
+    fc = _tree_train_predict(train, model, horizon)
+    print(f"    LightGBM: {model.best_iteration_} trees | "
+          f"forecast range [{fc.min():.1f}, {fc.max():.1f}] MW")
+    return model, fc
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — MODEL SELECTION: run all, pick best on validation MAE
+# ══════════════════════════════════════════════════════════════════════════════
+
 def select_best_univariate_model(
     series: pd.Series,
     plant_id: str,
+    plant_type: str,            # "solar" | "wind" | "hybrid"
     horizon: int = 72,
     val_hours: int = 168,
+    lstm_mae_threshold: float = 15.0,  # MW — tune per plant/fleet
 ) -> dict:
     """
-    Fits SARIMA, Prophet, and LSTM on train split.
-    Evaluates each on val split.
-    Returns the winner + its 72-hour forecast from the full series.
+    Model roster (in order of typical speed):
+      ETS       ~1s    — exponential smoothing baseline
+      Theta     ~1s    — classical decomposition
+      SARIMA    ~30s   — statistical, strong for wind
+      Prophet   ~60s   — handles solar zero-at-night
+      LightGBM  ~8s    — gradient boosting on lags, often best overall
+      XGBoost   ~15s   — alternative to LightGBM
+      LSTM      ~12min — hybrid plants only, and only when base models
+                         fail to beat lstm_mae_threshold
 
-    Parameters
-    ----------
-    series     : hourly generation series with DatetimeIndex
-    plant_id   : for logging
-    horizon    : forecast hours (default 72)
-    val_hours  : validation window size (default 168 = 7 days)
+    LSTM gate logic:
+      - solar / wind  → LSTM never runs (saves ~12 min per plant)
+      - hybrid        → LSTM runs only when best base MAE > lstm_mae_threshold
+                        i.e. treat it as an expensive fallback, not the default
 
-    Returns
-    -------
-    dict with keys:
-        plant_id, best_model, diagnostics, all_scores,
-        forecast_72h, forecast_timestamps, forecast_df   ← always present
+    plant_type is used ONLY for this gate — it is not fed as a feature
+    into any model to avoid data leakage.
     """
-    diag = diagnose_series(series, plant_id)
-    train, val = time_split(series, val_hours)
-    results = {}
+    _VALID_PLANT_TYPES = {"solar", "wind", "hybrid"}
+    if plant_type not in _VALID_PLANT_TYPES:
+        raise ValueError(
+            f"plant_type must be one of {_VALID_PLANT_TYPES}, got '{plant_type}'"
+        )
 
-    # ── SARIMA ──
+    diag       = diagnose_series(series, plant_id)
+    train, val = time_split(series, val_hours)
+    results    = {}
+
+    # ── ETS ──────────────────────────────────────────────────────────
+    try:
+        _, ets_fc = fit_ets(train, horizon=val_hours)
+        results["ets"] = {"scores": evaluate(val.values, ets_fc[:val_hours])}
+    except Exception as e:
+        print(f"  [ETS failed] {e}")
+
+    # ── Theta ─────────────────────────────────────────────────────────
+    try:
+        _, theta_fc = fit_theta(train, horizon=val_hours)
+        results["theta"] = {"scores": evaluate(val.values, theta_fc[:val_hours])}
+    except Exception as e:
+        print(f"  [Theta failed] {e}")
+
+    # ── SARIMA ────────────────────────────────────────────────────────
     try:
         _, sarima_fc = fit_sarima(train, horizon=val_hours)
-        results["sarima"] = {
-            "scores": evaluate(val.values, sarima_fc[:val_hours]),
-            "model_tag": "sarima",
-        }
+        results["sarima"] = {"scores": evaluate(val.values, sarima_fc[:val_hours])}
     except Exception as e:
         print(f"  [SARIMA failed] {e}")
 
-    # ── Prophet ──
+    # ── Prophet ───────────────────────────────────────────────────────
     try:
         _, prophet_fc = fit_prophet(train, horizon=val_hours)
-        results["prophet"] = {
-            "scores": evaluate(val.values, prophet_fc["yhat"].values),
-            "model_tag": "prophet",
-        }
+        results["prophet"] = {"scores": evaluate(val.values, prophet_fc["yhat"].values)}
     except Exception as e:
         print(f"  [Prophet failed] {e}")
 
-    # ── LSTM ──
+    # ── LightGBM ─────────────────────────────────────────────────────
     try:
-        _, _, lstm_fc = fit_lstm(train, horizon=val_hours)
-        results["lstm"] = {
-            "scores": evaluate(val.values, lstm_fc[:val_hours]),
-            "model_tag": "lstm",
-        }
+        _, lgbm_fc = fit_lightgbm(train, horizon=val_hours)
+        results["lightgbm"] = {"scores": evaluate(val.values, lgbm_fc[:val_hours])}
     except Exception as e:
-        print(f"  [LSTM failed] {e}")
+        print(f"  [LightGBM failed] {e}")
+
+    # ── XGBoost ───────────────────────────────────────────────────────
+    try:
+        _, xgb_fc = fit_xgboost(train, horizon=val_hours)
+        results["xgboost"] = {"scores": evaluate(val.values, xgb_fc[:val_hours])}
+    except Exception as e:
+        print(f"  [XGBoost failed] {e}")
 
     if not results:
-        raise RuntimeError(f"All models failed for {plant_id}")
+        raise RuntimeError(f"All base models failed for {plant_id}")
+
+    # ── LSTM: hybrid-only, threshold-gated fallback ───────────────────
+    best_base_mae = min(r["scores"]["MAE"] for r in results.values())
+
+    _run_lstm = (
+        plant_type == "hybrid"
+        and best_base_mae > lstm_mae_threshold
+    )
+
+    if _run_lstm:
+        print(
+            f"  [LSTM] Triggered — plant_type=hybrid, "
+            f"best base MAE={best_base_mae:.3f} > threshold={lstm_mae_threshold}"
+        )
+        try:
+            _, _, lstm_fc = fit_lstm(train, horizon=val_hours)
+            results["lstm"] = {"scores": evaluate(val.values, lstm_fc[:val_hours])}
+        except Exception as e:
+            print(f"  [LSTM failed] {e}")
+    elif plant_type == "hybrid":
+        print(
+            f"  [LSTM] Skipped — base models sufficient "
+            f"(best MAE={best_base_mae:.3f} ≤ threshold={lstm_mae_threshold})"
+        )
+    else:
+        print(f"  [LSTM] Skipped — plant_type={plant_type} (hybrid only)")
 
     # ── Pick winner on MAE ────────────────────────────────────────────
     best_name = min(results, key=lambda m: results[m]["scores"]["MAE"])
-    print(f"\n  Winner for {plant_id}: {best_name.upper()}")
+
+    print(f"\n  Winner for {plant_id} ({plant_type}): {best_name.upper()}")
     for m, r in results.items():
         flag = " <--" if m == best_name else ""
-        print(f"    {m:8s}: MAE={r['scores']['MAE']:.3f}  "
-              f"RMSE={r['scores']['RMSE']:.3f}  "
-              f"MAPE={r['scores']['MAPE']:.1f}%{flag}")
+        print(
+            f"    {m:10s}: MAE={r['scores']['MAE']:.3f}  "
+            f"RMSE={r['scores']['RMSE']:.3f}  "
+            f"MAPE={r['scores']['MAPE']:.1f}%{flag}"
+        )
 
     # ── Refit winner on FULL series ───────────────────────────────────
     print(f"\n  Refitting {best_name} on full series for {horizon}h forecast...")
 
     forecast_timestamps = pd.date_range(
         start=series.index[-1] + pd.Timedelta(hours=1),
-        periods=horizon,
-        freq="h",
+        periods=horizon, freq="h",
     )
-
     fc_mw    = np.zeros(horizon)
     fc_lower = np.zeros(horizon)
     fc_upper = np.zeros(horizon)
 
-    if best_name == "sarima":
+    if best_name == "ets":
+        fit_obj, fc_mw = fit_ets(series, horizon=horizon)
+        fc_lower = np.maximum(0, fc_mw * 0.85)
+        fc_upper = fc_mw * 1.15
+
+    elif best_name == "theta":
+        fit_obj, fc_mw = fit_theta(series, horizon=horizon)
+        fc_lower = np.maximum(0, fc_mw * 0.85)
+        fc_upper = fc_mw * 1.15
+
+    elif best_name == "sarima":
         fit_obj, fc_mw = fit_sarima(series, horizon=horizon)
         try:
             ci       = fit_obj.get_forecast(steps=horizon).conf_int(alpha=0.10)
@@ -484,13 +820,24 @@ def select_best_univariate_model(
         fc_lower = fc_df_full["yhat_lower"].clip(lower=0).values
         fc_upper = fc_df_full["yhat_upper"].values
 
+    elif best_name == "lightgbm":
+        fit_obj, fc_mw = fit_lightgbm(series, horizon=horizon)
+        rmse     = results["lightgbm"]["scores"]["RMSE"]
+        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse)
+        fc_upper = fc_mw + 1.5 * rmse
+
+    elif best_name == "xgboost":
+        fit_obj, fc_mw = fit_xgboost(series, horizon=horizon)
+        rmse     = results["xgboost"]["scores"]["RMSE"]
+        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse)
+        fc_upper = fc_mw + 1.5 * rmse
+
     elif best_name == "lstm":
         _, _, fc_mw = fit_lstm(series, horizon=horizon)
         rmse     = results["lstm"]["scores"]["RMSE"]
         fc_lower = np.maximum(0, fc_mw - 1.5 * rmse)
         fc_upper = fc_mw + 1.5 * rmse
 
-    # ── Always build forecast_df ──────────────────────────────────────
     forecast_df = pd.DataFrame({
         "plant_id":    plant_id,
         "timestamp":   forecast_timestamps,
@@ -502,40 +849,38 @@ def select_best_univariate_model(
 
     return {
         "plant_id":            plant_id,
+        "plant_type":          plant_type,
         "best_model":          best_name,
+        "lstm_triggered":      _run_lstm,
         "diagnostics":         diag,
         "all_scores":          {m: r["scores"] for m, r in results.items()},
-        "forecast_72h":        fc_mw,               # raw array — kept for compatibility
+        "forecast_72h":        fc_mw,
         "forecast_timestamps": forecast_timestamps,
-        "forecast_df":         forecast_df,          # ← now always built
+        "forecast_df":         forecast_df,
     }
-
-
-
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # WORKER — runs in its own process, one plant at a time
 # Must be a top-level function (not a lambda/nested) for joblib to pickle it
 # ══════════════════════════════════════════════════════════════════════════
 
-def _process_one_plant(plant_id: str, plant_df: pd.DataFrame, horizon: int) -> dict:
+def _process_one_plant(
+    plant_id: str,
+    plant_df: pd.DataFrame,
+    plant_type: str,            # ← added
+    horizon: int,
+    lstm_mae_threshold: float,  # ← added (pass-through to model selector)
+) -> dict:
     """
     Isolated worker function called by joblib for each plant.
 
     Returns a result dict with keys:
         status       : "ok" | "skip" | "error"
         plant_id     : str
+        plant_type   : str
         forecast_df  : pd.DataFrame | None
         log_row      : dict | None
         error        : str | None
-
-    Why return a dict instead of raising:
-        joblib catches worker exceptions and re-raises them in the main process,
-        which breaks the other workers. Returning a structured result lets the
-        main process collect all outcomes and decide what to do.
     """
-    # Each worker process needs its own warning filter
     warnings.filterwarnings("ignore")
 
     try:
@@ -553,31 +898,41 @@ def _process_one_plant(plant_id: str, plant_df: pd.DataFrame, horizon: int) -> d
             return {
                 "status":      "skip",
                 "plant_id":    plant_id,
+                "plant_type":  plant_type,
                 "forecast_df": None,
                 "log_row":     None,
                 "error":       f"insufficient_data: {len(series)} hrs",
             }
 
         # ── Model selection ───────────────────────────────────────────
-        result = select_best_univariate_model(series, plant_id, horizon=horizon)
+        result = select_best_univariate_model(
+            series,
+            plant_id,
+            plant_type=plant_type,                  # ← new
+            horizon=horizon,
+            lstm_mae_threshold=lstm_mae_threshold,  # ← new
+        )
 
         fc_df = result.get("forecast_df")
         if fc_df is None or len(fc_df) == 0:
             return {
                 "status":      "error",
                 "plant_id":    plant_id,
+                "plant_type":  plant_type,
                 "forecast_df": None,
                 "log_row":     None,
                 "error":       "empty forecast_df returned",
             }
 
         log_row = {
-            "plant_id":   plant_id,
-            "n_features": len(plant_df.columns),
-            "n_obs":      result["diagnostics"]["n_obs"],
-            "zero_rate":  result["diagnostics"]["zero_rate"],
-            "cv":         result["diagnostics"]["cv"],
-            "best_model": result["best_model"],
+            "plant_id":       plant_id,
+            "plant_type":     plant_type,           # ← new (useful in model_selection_log.csv)
+            "n_features":     len(plant_df.columns),
+            "n_obs":          result["diagnostics"]["n_obs"],
+            "zero_rate":      result["diagnostics"]["zero_rate"],
+            "cv":             result["diagnostics"]["cv"],
+            "best_model":     result["best_model"],
+            "lstm_triggered": result["lstm_triggered"],  # ← new (track LSTM usage in log)
         }
         for model_name, sc in result["all_scores"].items():
             log_row[f"{model_name}_MAE"]  = sc["MAE"]
@@ -587,6 +942,7 @@ def _process_one_plant(plant_id: str, plant_df: pd.DataFrame, horizon: int) -> d
         return {
             "status":      "ok",
             "plant_id":    plant_id,
+            "plant_type":  plant_type,
             "forecast_df": fc_df,
             "log_row":     log_row,
             "error":       None,
@@ -596,15 +952,17 @@ def _process_one_plant(plant_id: str, plant_df: pd.DataFrame, horizon: int) -> d
         return {
             "status":      "error",
             "plant_id":    plant_id,
+            "plant_type":  plant_type,
             "forecast_df": None,
             "log_row":     None,
             "error":       f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
         }
 
 
+
 # ══════════════════════════════════════════════════════════════════════════
 # FLEET RUNNER — parallelised with joblib
-# ══════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════=
 
 def run_univariate_fleet(
     fleet_df: pd.DataFrame,
@@ -612,14 +970,16 @@ def run_univariate_fleet(
     output_path: str = "data/forecasts/univariate_forecasts.csv",
     n_jobs: int = -1,
     backend: str = "loky",
+    lstm_mae_threshold: float = 15.0,   # ← added; forwarded to every worker
 ) -> pd.DataFrame:
     """
     Parallelised univariate model selection and forecasting for all plants.
 
     Parameters
     ----------
-    fleet_df    : Pre-processed feature-engineered dataframe, all plants.
-                  Required columns: plant_id, timestamp, generation.
+    fleet_df    : Pre-processed dataframe, all plants.
+                  Required columns: plant_id, timestamp, generation, plant_type.
+                  plant_type must be one of: "solar" | "wind" | "hybrid"
 
     horizon     : Forecast horizon in hours. Default 72.
 
@@ -639,74 +999,92 @@ def run_univariate_fleet(
     backend     : joblib backend.
                   "loky"      = default, process-based, safest for statsmodels/prophet
                   "threading" = thread-based, use only if models release the GIL
-                                (they mostly don't — stick with loky)
+
+    lstm_mae_threshold : MAE ceiling (MW) above which LSTM is tried on hybrid
+                         plants. Has no effect on solar/wind. Default 15.0.
 
     Returns
     -------
     pd.DataFrame : Combined forecast for all plants (long format).
     """
-    # ── Validate ──────────────────────────────────────────────────────
-    required = {"plant_id", "timestamp", "generation"}
+    # ── Validate columns ──────────────────────────────────────────────
+    required = {"plant_id", "timestamp", "generation", "plant_type"}  # ← plant_type added
     missing  = required - set(fleet_df.columns)
     if missing:
         raise ValueError(
             f"fleet_df missing required columns: {missing}\n"
-            f"Run preprocess() first — it aliases actual_generation_mw → generation."
+            f"Ensure plant_type ('solar'|'wind'|'hybrid') is present before calling."
+        )
+
+    # ── Validate plant_type values ────────────────────────────────────
+    valid_types   = {"Solar", "Wind", "Hybrid"}
+    bad_types     = set(fleet_df["plant_type"].unique()) - valid_types
+    if bad_types:
+        raise ValueError(
+            f"Unknown plant_type values found: {bad_types}. "
+            f"Must be one of {valid_types}."
         )
 
     fleet_df = fleet_df.copy()
     fleet_df["timestamp"] = pd.to_datetime(fleet_df["timestamp"])
+    fleet_df["plant_type"] = fleet_df["plant_type"].str.strip().str.lower() 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Split into per-plant dataframes ───────────────────────────────
-    # Do this BEFORE joblib so we're passing DataFrames, not a GroupBy object
-    # (GroupBy objects are not picklable across processes)
+    # Pull plant_type once per plant — it's constant within a plant group
     plant_groups = [
-        (plant_id, plant_df.reset_index(drop=True))
+        (plant_id, plant_df.reset_index(drop=True), plant_df["plant_type"].iloc[0])
         for plant_id, plant_df in fleet_df.groupby("plant_id")
     ]
     n_plants = len(plant_groups)
 
     # ── Resolve n_jobs ────────────────────────────────────────────────
     import multiprocessing
-    max_cores   = multiprocessing.cpu_count()
+    max_cores     = multiprocessing.cpu_count()
     resolved_jobs = max_cores if n_jobs == -1 else min(n_jobs, max_cores)
-    # Never run more workers than plants — wastes overhead
     resolved_jobs = min(resolved_jobs, n_plants)
+
+    # ── Fleet composition summary ─────────────────────────────────────
+    type_counts = fleet_df.groupby("plant_type")["plant_id"].nunique()
 
     print(f"\n{'═'*60}")
     print(f"  FLEET UNIVARIATE FORECAST")
-    print(f"  Plants   : {n_plants}")
+    print(f"  Plants   : {n_plants}  "
+          f"(solar={type_counts.get('Solar', 0)}  "
+          f"wind={type_counts.get('Wind', 0)}  "
+          f"hybrid={type_counts.get('Hybrid', 0)})")
     print(f"  Horizon  : {horizon}h")
     print(f"  Workers  : {resolved_jobs} / {max_cores} cores  (n_jobs={n_jobs})")
     print(f"  Backend  : {backend}")
+    print(f"  LSTM threshold : {lstm_mae_threshold} MAE (hybrid only)")
     print(f"{'═'*60}\n")
 
     # ── Parallel execution ────────────────────────────────────────────
-    # verbose=10 prints a progress line per completed job
     results = Parallel(n_jobs=resolved_jobs, backend=backend, verbose=10)(
-        delayed(_process_one_plant)(plant_id, plant_df, horizon)
-        for plant_id, plant_df in plant_groups
+        delayed(_process_one_plant)(plant_id, plant_df, plant_type, horizon, lstm_mae_threshold)
+        for plant_id, plant_df, plant_type in plant_groups  # ← unpack plant_type
     )
 
     # ── Collect results ───────────────────────────────────────────────
-    all_forecasts  = []
-    selection_log  = []
-    failed_plants  = []
+    all_forecasts = []
+    selection_log = []
+    failed_plants = []
 
     for res in results:
-        pid = res["plant_id"]
+        pid   = res["plant_id"]
+        ptype = res["plant_type"]
         if res["status"] == "ok":
             all_forecasts.append(res["forecast_df"])
             selection_log.append(res["log_row"])
-            print(f"  ✓ {pid} — {res['log_row']['best_model']}"
-                  f"  MAE={res['log_row'].get(res['log_row']['best_model']+'_MAE','?')}")
+            lstm_flag = " [LSTM]" if res["log_row"].get("lstm_triggered") else ""
+            print(f"  ✓ {pid} ({ptype}) — {res['log_row']['best_model']}{lstm_flag}"
+                  f"  MAE={res['log_row'].get(res['log_row']['best_model']+'_MAE', '?')}")
         elif res["status"] == "skip":
-            print(f"  ⊘ {pid} — skipped: {res['error']}")
-            failed_plants.append({"plant_id": pid, "error": res["error"]})
+            print(f"  ⊘ {pid} ({ptype}) — skipped: {res['error']}")
+            failed_plants.append({"plant_id": pid, "plant_type": ptype, "error": res["error"]})
         else:
-            print(f"  ✗ {pid} — ERROR: {res['error'].splitlines()[0]}")
-            failed_plants.append({"plant_id": pid, "error": res["error"]})
+            print(f"  ✗ {pid} ({ptype}) — ERROR: {res['error'].splitlines()[0]}")
+            failed_plants.append({"plant_id": pid, "plant_type": ptype, "error": res["error"]})
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'═'*60}")
@@ -719,6 +1097,10 @@ def run_univariate_fleet(
         print(f"\n  Model distribution:")
         for model, cnt in log_df["best_model"].value_counts().items():
             print(f"    {model:10s}: {cnt:3d} plants ({cnt/len(log_df):.0%})")
+
+        lstm_hits = log_df["lstm_triggered"].sum()
+        if lstm_hits:
+            print(f"\n  LSTM triggered on {lstm_hits} hybrid plant(s)")
     print(f"{'═'*60}\n")
 
     # ── Save logs ─────────────────────────────────────────────────────
