@@ -1,0 +1,85 @@
+plant_id,plant_type,error
+PLANT_013,hybrid,"MemoryError: Unable to allocate 219. MiB for an array with shape (50, 50, 11498) and data type float64
+Traceback (most recent call last):
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 908, in _process_one_plant
+    result = select_best_univariate_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 808, in select_best_univariate_model
+    fit_obj, fc_mw = fit_sarima(series, horizon=horizon)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 255, in fit_sarima
+    fit = model.fit(disp=False)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\mlemodel.py"", line 729, in fit
+    res = func(mlefit.params, transformed=False, includes_fixed=False,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\mlemodel.py"", line 887, in smooth
+    result = self.ssm.smooth(complex_step=complex_step, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_smoother.py"", line 403, in smooth
+    kfilter = self._filter(**kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_filter.py"", line 913, in _filter
+    self._initialize_filter(
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_filter.py"", line 501, in _initialize_filter
+    self._kalman_filters[prefix] = cls(
+                                   ^^^^
+  File ""statsmodels/tsa/statespace/_kalman_filter.pyx"", line 1720, in statsmodels.tsa.statespace._kalman_filter.dKalmanFilter.__init__
+  File ""statsmodels/tsa/statespace/_kalman_filter.pyx"", line 2131, in statsmodels.tsa.statespace._kalman_filter.dKalmanFilter.set_filter_method
+  File ""statsmodels/tsa/statespace/_kalman_filter.pyx"", line 1896, in statsmodels.tsa.statespace._kalman_filter.dKalmanFilter.allocate_arrays
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 219. MiB for an array with shape (50, 50, 11498) and data type float64
+"
+PLANT_015,wind,"MemoryError: Unable to allocate 219. MiB for an array with shape (50, 50, 11497) and data type float64
+Traceback (most recent call last):
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 908, in _process_one_plant
+    result = select_best_univariate_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 808, in select_best_univariate_model
+    fit_obj, fc_mw = fit_sarima(series, horizon=horizon)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 255, in fit_sarima
+    fit = model.fit(disp=False)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\mlemodel.py"", line 729, in fit
+    res = func(mlefit.params, transformed=False, includes_fixed=False,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\mlemodel.py"", line 887, in smooth
+    result = self.ssm.smooth(complex_step=complex_step, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_smoother.py"", line 410, in smooth
+    results.update_filter(kfilter)
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_filter.py"", line 1539, in update_filter
+    self.filtered_state_cov = np.array(
+                              ^^^^^^^^^
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 219. MiB for an array with shape (50, 50, 11497) and data type float64
+"
+PLANT_024,solar,"MemoryError: Unable to allocate 219. MiB for an array with shape (50, 50, 11498) and data type float64
+Traceback (most recent call last):
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 908, in _process_one_plant
+    result = select_best_univariate_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 808, in select_best_univariate_model
+    fit_obj, fc_mw = fit_sarima(series, horizon=horizon)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\univariate.py"", line 255, in fit_sarima
+    fit = model.fit(disp=False)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\mlemodel.py"", line 729, in fit
+    res = func(mlefit.params, transformed=False, includes_fixed=False,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\mlemodel.py"", line 887, in smooth
+    result = self.ssm.smooth(complex_step=complex_step, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_smoother.py"", line 403, in smooth
+    kfilter = self._filter(**kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_filter.py"", line 913, in _filter
+    self._initialize_filter(
+  File ""d:\Portfolio Github\Pravaah\.venv\Lib\site-packages\statsmodels\tsa\statespace\kalman_filter.py"", line 501, in _initialize_filter
+    self._kalman_filters[prefix] = cls(
+                                   ^^^^
+  File ""statsmodels/tsa/statespace/_kalman_filter.pyx"", line 1720, in statsmodels.tsa.statespace._kalman_filter.dKalmanFilter.__init__
+  File ""statsmodels/tsa/statespace/_kalman_filter.pyx"", line 2131, in statsmodels.tsa.statespace._kalman_filter.dKalmanFilter.set_filter_method
+  File ""statsmodels/tsa/statespace/_kalman_filter.pyx"", line 1896, in statsmodels.tsa.statespace._kalman_filter.dKalmanFilter.allocate_arrays
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 219. MiB for an array with shape (50, 50, 11498) and data type float64
+"
