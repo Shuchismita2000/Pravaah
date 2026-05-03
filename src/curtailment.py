@@ -549,6 +549,14 @@ def apply_curtailment_correction(
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 6 — FLEET RUNNER
 # ══════════════════════════════════════════════════════════════════════
+import joblib
+from pathlib import Path
+from datetime import datetime
+
+MODEL_DIR = Path("models/curtailment")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def _process_curtailment_one_plant(
     plant_id: str,
@@ -564,7 +572,31 @@ def _process_curtailment_one_plant(
         result = forecast_curtailment_one_plant(
             plant_id, plant_df, future_df, val_days
         )
-        return {"status": "ok", "plant_id": plant_id, **result}
+         # ── Save model ───────────────────────────────
+        model = result.get("model", None)
+        if model is not None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            model_path = MODEL_DIR / f"{plant_id}_curtailment_model_{ts}.joblib"
+
+            joblib.dump(
+                {
+                    "model": model,
+                    "plant_id": plant_id,
+                    "plant_type": plant_type,
+                    "capacity_mw": float(capacity_mw),
+                    "val_days": val_days,
+                },
+                model_path,
+                compress=3,
+            )
+
+        # ── Return success result ────────────────────
+        return {
+            "status": "ok",
+            "plant_id": plant_id,
+            "forecast_df": result.get("forecast_df"),
+        }
+    
     except Exception as e:
         import traceback
         return {

@@ -350,6 +350,12 @@ def prepare_health_input(
 # ══════════════════════════════════════════════════════════════════════
 # PART 4 — FLEET RUNNERS (parallelised)
 # ══════════════════════════════════════════════════════════════════════
+import joblib
+from pathlib import Path
+from datetime import datetime
+
+MODEL_DIR = Path("models/health factor")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def _health_worker(plant_id, plant_df, lifecycle_df, horizon):
     warnings.filterwarnings("ignore")
@@ -366,6 +372,22 @@ def _health_worker(plant_id, plant_df, lifecycle_df, horizon):
         result   = forecast_health_factor_one_plant(
             plant_id, series, plant_lc, horizon
         )
+
+        # ── Save model ───────────────────────────────
+        model = result.get("model", None)
+        if model is not None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            model_path = MODEL_DIR / f"{plant_id}_health_model_{ts}.joblib"
+
+            joblib.dump(
+                {
+                    "model": model,
+                    "plant_id": plant_id,
+                    "horizon": horizon,
+                },
+                model_path,
+                compress=3,
+            )
         return {"status": "ok", "plant_id": plant_id,
                 "forecast_df": result["forecast_df"],
                 "repair_events": result["repair_events"]}

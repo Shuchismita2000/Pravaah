@@ -862,54 +862,75 @@ def simulate_scenarios(
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 9 — FLEET RUNNER
 # ══════════════════════════════════════════════════════════════════════
+import joblib
+from pathlib import Path
+from datetime import datetime
+
+BASE_MODEL_DIR = Path("models/multivariate")
 
 def _process_one_plant(
-    plant_id:      str,
-    plant_df:      pd.DataFrame,
-    feature_cols:  list[str] | None,
-    val_days:      int,
-    n_splits:      int,
-    n_simulations: int,
-) -> dict:
-    """
-    Joblib worker — processes one plant. Never raises.
-    Exceptions are caught and returned in result['error'].
-    """
+    plant_id, plant_df, feature_cols, val_days, n_splits, n_simulations
+):
     warnings.filterwarnings("ignore")
+
     try:
         result = select_best_multivariate_model(
-            plant_df, plant_id, feature_cols, val_days, n_splits
+            plant_df, plant_id, feature_cols,
+            val_days=val_days, n_splits=n_splits
         )
-        cap_mw = None
-        if "capacity_mw" in plant_df.columns:
-            vals   = plant_df["capacity_mw"].dropna()
-            cap_mw = float(vals.iloc[0]) if len(vals) else None
 
+        # ── Extract plant_type ───────────────────────
+        plant_type = "unknown"
+        if "plant_type" in plant_df.columns:
+            plant_type = str(
+                plant_df["plant_type"].dropna().iloc[0]
+            ).strip().lower().replace(" ", "_")
+
+        # ── Save model ──────────────────────────────
+        model = result.get("model")
+        if model is not None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+            model_dir = BASE_MODEL_DIR / plant_type
+            model_dir.mkdir(parents=True, exist_ok=True)
+
+            versioned_path = model_dir / f"{plant_id}_model_{ts}.joblib"
+            latest_path    = model_dir / f"{plant_id}_latest.joblib"
+
+            payload = {
+                "model": model,
+                "plant_id": plant_id,
+                "plant_type": plant_type,
+                "feature_cols": feature_cols,
+                "model_name": result.get("best_model"),
+            }
+
+            joblib.dump(payload, versioned_path, compress=3)
+            joblib.dump(payload, latest_path, compress=3)  # 👈 latest pointer
+
+        # ── Simulations ─────────────────────────────
         sim_df = simulate_scenarios(
-            result["forecast_df"], result["decomposition"],
-            capacity_mw=cap_mw, n_simulations=n_simulations,
+            result["forecast_df"],
+            result["decomposition"],
+            capacity_mw=result.get("capacity_mw"),
+            n_simulations=n_simulations,
         )
-        ds = None
-        if result["decomposition"]:
-            d  = result["decomposition"]
-            ds = {k: d[k] for k in [
-                "seasonal_strength", "weekly_strength", "trend_strength",
-                "residual_std", "dominant_period", "forecast_difficulty",
-            ]}
+
         return {
-            "status": "ok", "plant_id": plant_id,
+            "status": "ok",
+            "plant_id": plant_id,
             "forecast_df": result["forecast_df"],
             "simulation_df": sim_df,
-            "best_model": result["best_model"],
-            "avg_scores": result["avg_scores"],
-            "decomp_summary": ds, "error": None,
+            "best_model": result.get("best_model"),
+            "avg_scores": result.get("avg_scores"),
+            "decomp_summary": result.get("decomp_summary"),
         }
+
     except Exception as e:
+        import traceback
         return {
-            "status": "error", "plant_id": plant_id,
-            "forecast_df": None, "simulation_df": None,
-            "best_model": None, "avg_scores": None,
-            "decomp_summary": None,
+            "status": "error",
+            "plant_id": plant_id,
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
         }
 
@@ -1057,6 +1078,9 @@ def run_multivariate_fleet(
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 10 — PUBLIC API
 # ══════════════════════════════════════════════════════════════════════
+import joblib
+from pathlib import Path
+from datetime import datetime
 
 def run_single_plant(
     historical_df: pd.DataFrame,
@@ -1064,6 +1088,7 @@ def run_single_plant(
     plant_id:      str,
     n_simulations: int = 1000,
     feature_cols:  list[str] | None = None,
+    plant_type:    str = "unknown",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run the full pipeline for ONE plant. Useful for debugging.
@@ -1100,6 +1125,30 @@ def run_single_plant(
     mask   = historical_df["plant_id"] == plant_id
     if mask.any() and "capacity_mw" in historical_df.columns:
         cap_mw = float(historical_df.loc[mask, "capacity_mw"].iloc[0])
+
+     # ── Save model ───────────────────────────────
+    model = result.get("model", None)
+    if model is not None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+        model_dir = Path("models/multivariate") / plant_type
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        model_path = model_dir / f"{plant_id}_model_{ts}.joblib"
+
+        joblib.dump(
+            {
+                "model": model,
+                "plant_id": plant_id,
+                "plant_type": plant_type,
+                "capacity_mw": cap_mw,
+                "feature_cols": feature_cols,
+                "model_name": result.get("model_name"),
+            },
+            model_path,
+            compress=3,
+        )
+
 
     sim_df = simulate_scenarios(
         result["forecast_df"], result["decomposition"],

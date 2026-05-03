@@ -336,6 +336,12 @@ def prepare_availability_input(
 # ══════════════════════════════════════════════════════════════════════
 # PART 4 — FLEET RUNNERS (parallelised)
 # ══════════════════════════════════════════════════════════════════════
+import joblib
+from pathlib import Path
+from datetime import datetime
+
+MODEL_DIR = Path("models/availability")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def _availability_worker(plant_id, plant_df, horizon):
     warnings.filterwarnings("ignore")
@@ -354,6 +360,23 @@ def _availability_worker(plant_id, plant_df, horizon):
         result = forecast_availability_one_plant(
             plant_id, series, capacity_mw, horizon
         )
+                # ── Save model ───────────────────────────────
+        model = result.get("model", None)
+        if model is not None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            model_path = MODEL_DIR / f"{plant_id}_availability_model_{ts}.joblib"
+
+            joblib.dump(
+                {
+                    "model": model,
+                    "plant_id": plant_id,
+                    "capacity_mw": float(capacity_mw),
+                    "horizon": horizon,
+                    "model_name": result.get("best_model"),
+                },
+                model_path,
+                compress=3,
+            )
         return {"status": "ok", "plant_id": plant_id,
                 "forecast_df": result["forecast_df"],
                 "best_model":  result["best_model"]}
