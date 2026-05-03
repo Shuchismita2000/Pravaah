@@ -1,8 +1,6 @@
 """
 Karnataka Renewable Energy Grid — Feature Engineering Pipeline
 ==============================================================
-Leakage-free version: all features derived from `generation` (= actual_generation_mw)
-have been removed, except strictly-past lag/rolling windows.
 """
 
 import numpy as np
@@ -45,10 +43,6 @@ def _solar_features(df: pd.DataFrame, capacity_kw: float) -> pd.DataFrame:
     """
     Solar physics + panel efficiency features.
     NOTE: hour/day_of_year NOT repeated here (handled by _base_time_features).
-
-    REMOVED (leakage):
-        - performance_ratio     → used generation (= target)
-        - pr_rolling_7/30       → derived from performance_ratio
     """
     epsilon = 1e-6
 
@@ -153,52 +147,6 @@ def _wind_features(
     df["wind_speed_rolling_std_6"] = df["wind_speed"].rolling(6).std()
 
     return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 3 — PLANT BEHAVIOR FEATURES
-# Applied to ALL plant types AFTER type-specific layers
-# Only strictly-past lag/rolling windows are kept — no current-timestep target
-# ══════════════════════════════════════════════════════════════════════════════
-
-# def _plant_behavior_features(df: pd.DataFrame) -> pd.DataFrame:
-#     """
-#     Temporal features common to every plant type.
-#     Uses generation (= actual_generation_mw) ONLY via shift/rolling with
-#     closed='left' so the current timestep is never included.
-
-#     REMOVED (leakage — used generation at time t):
-#         - cuf                   → generation / capacity at t
-#         - ramp_rate / ramp_abs  → diff includes t vs t-1 (current target visible)
-#         - gen_momentum_3/6      → generation[t] - generation[t-3]
-#         - daily_generation      → rolling sum ending at t
-#         - load_factor           → derived from daily_generation
-#         - is_peak               → rolling max ending at t
-#         - gen_variability_24/168→ rolling std ending at t
-#         - is_zero_gen           → generation[t] == 0
-#         - zero_streak           → derived from is_zero_gen
-#         - gen_residual_24       → generation[t] - rolling_mean ending at t
-#         - gen_normalized        → generation[t] / rolling_mean ending at t
-
-#     KEPT (safe — strictly past data, shifted before use):
-#         - gen_lag_1/24/168      → shift(n), n ≥ 1
-#         - gen_rolling_mean_6/24/168 → rolling(n).mean().shift(1)
-#         - gen_rolling_std_6     → rolling(n).std().shift(1)
-#     """
-#     df = df.sort_values("timestamp").reset_index(drop=True)
-
-#     # 1. Lag features (temporal autocorrelation) — strictly past timesteps
-#     df["gen_lag_1"]   = df["generation"].shift(1)    # t-1 hour
-#     df["gen_lag_24"]  = df["generation"].shift(24)   # same hour yesterday
-#     df["gen_lag_168"] = df["generation"].shift(168)  # same hour last week
-
-#     # 2. Rolling statistics — shift(1) ensures window ends at t-1, never t
-#     df["gen_rolling_mean_6"]   = df["generation"].rolling(6).mean().shift(1)
-#     df["gen_rolling_std_6"]    = df["generation"].rolling(6).std().shift(1)
-#     df["gen_rolling_mean_24"]  = df["generation"].rolling(24).mean().shift(1)
-#     df["gen_rolling_mean_168"] = df["generation"].rolling(168).mean().shift(1)
-
-#     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════

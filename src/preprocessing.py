@@ -1,15 +1,6 @@
 """
 Karnataka Renewable Energy Grid — Pre-Processing Pipeline
 =========================================================
-Run this BEFORE feature_engineering.py
-
-Input columns (from your merged dataframe):
-    plant_id, plant_type, capacity_mw,
-    actual_generation_mw, availability_mw, curtailment_mw,
-    health_factor, irradiance_wm2,
-    temperature, cloud_cover, wind_speed, wind_direction,
-    irradiance,                         ← duplicate of irradiance_wm2, needs resolution
-    year, month, day, hour              ← split time parts, need to be rebuilt into timestamp
 
 Steps:
     1. Schema validation      — check required columns exist, right dtypes
@@ -17,16 +8,12 @@ Steps:
     3. Physical bounds check  — clip impossible sensor values
     4. Missing value strategy — per-column imputation logic
     5. Outlier treatment      — IQR + domain-aware capping
-    6. Categorical encoding   — plant_type → integer codes + dummies
-    7. Derived base columns   — things FE pipeline expects but aren't in raw data
-    8. Per-plant normalisation — optional, for cross-plant ML
-    9. Final dtype cast       — everything to float32 except IDs
-    10. QA report              — summary of what was changed
+    6. Final dtype cast       — everything to float32 except IDs
+    7. QA report              — summary of what was changed
 """
 
 import pandas as pd
 import numpy as np
-from typing import Tuple
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -78,27 +65,23 @@ PLANT_TYPE_MAP = {"Solar": 0, "Wind": 1, "Hybrid": 2}
 # STEP 1 — SCHEMA VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def validate_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Check required columns exist. Warn on missing optional ones.
-    Raises ValueError if any required column is absent.
-    """
-    missing_required = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing_required:
-        raise ValueError(
-            f"Missing required columns: {missing_required}\n"
-            f"Available columns: {df.columns.tolist()}"
-        )
+def validate_schema(df: pd.DataFrame, is_forecast: bool = False) -> pd.DataFrame:
+    
+    required = [
+        "timestamp", "plant_id", "capacity_mw",
+        "temperature", "cloud_cover", "wind_speed",
+        "wind_direction", "irradiance", "health_factor",
+    ]
 
-    optional = ["temperature", "cloud_cover", "wind_speed", "wind_direction", "irradiance"]
-    missing_optional = [c for c in optional if c not in df.columns]
-    if missing_optional:
-        print(f"[WARN] Optional columns missing (will be filled with defaults): {missing_optional}")
+    # Only required during training, not at inference
+    if is_forecast == False:
+        required.append("actual_generation_mw")
 
-    print(f"[OK] Schema validated — {len(df):,} rows, {len(df.columns)} columns")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+
     return df
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2 — RESOLVE DUPLICATE IRRADIANCE COLUMNS
@@ -205,7 +188,7 @@ def enforce_physical_bounds(df: pd.DataFrame) -> pd.DataFrame:
 # STEP 5 — MISSING VALUE IMPUTATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
+def impute_missing(df: pd.DataFrame, is_forecast: bool = False) -> pd.DataFrame:
     """
     Different columns need different imputation strategies:
 
@@ -222,12 +205,14 @@ def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
     | wind_direction          | Forward fill                       | Circular, ffill safest      |
     """
     def _per_plant(group):
-        # Generation — forward fill short gaps, then 0 for long outages
-        group["actual_generation_mw"] = (
-            group["actual_generation_mw"]
-            .ffill(limit=3)   # fill up to 3 consecutive missing hours
-            .fillna(0)
-        )
+
+        if is_forecast == False:
+            # Generation — forward fill short gaps, then 0 for long outages
+            group["generation"] = (
+                group["actual_generation_mw"]
+                .ffill(limit=3)   # fill up to 3 consecutive missing hours
+                .fillna(0)
+            )
         # Availability
         group["availability_mw"] = (
             group["availability_mw"]
@@ -361,127 +346,7 @@ def treat_outliers(df: pd.DataFrame, method: str = "iqr") -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 7 — CATEGORICAL ENCODING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    plant_type needs to be encoded for ML models.
-
-    Two encodings added (let the modeller pick):
-      - plant_type_code : integer ordinal  (0=Solar, 1=Wind, 2=Hybrid)
-      - plant_type_*    : one-hot dummies  (better for tree models)
-
-    plant_id is kept as string for grouping — do NOT encode it here,
-    leave that for embedding or target-encoding in the model layer.
-    """
-    df["plant_type"] = df["plant_type"].str.strip().str.title()
-    unmapped = df[~df["plant_type"].isin(PLANT_TYPE_MAP)]["plant_type"].unique()
-    if len(unmapped) > 0:
-        print(f"[WARN] Unknown plant_type values: {unmapped} — will be NaN in code column")
-
-    df["plant_type_code"] = df["plant_type"].map(PLANT_TYPE_MAP)
-
-    # One-hot (drop_first=False — keep all 3, model can select)
-    dummies = pd.get_dummies(df["plant_type"], prefix="plant_type", dtype=int)
-    df = pd.concat([df, dummies], axis=1)
-
-    print(f"[OK] Encoded plant_type → codes + dummies: {dummies.columns.tolist()}")
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 8 — DERIVED BASE COLUMNS (FE PIPELINE PREREQUISITES)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def add_derived_base_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    The feature engineering pipeline expects a column called 'generation'.
-    Your raw data calls it 'actual_generation_mw'. Align here, not inside FE.
-
-    Also adds a few simple derived columns that every downstream model needs
-    but that don't belong in the FE physics layers.
-    """
-    # Rename for FE pipeline compatibility
-    if "actual_generation_mw" in df.columns and "generation" not in df.columns:
-        df["generation"] = df["actual_generation_mw"]
-        print("[OK] Aliased actual_generation_mw → generation")
-
-    # Capacity factor (actual / nameplate) — fundamental derived signal
-    df["capacity_factor"] = (
-        df["actual_generation_mw"] / (df["capacity_mw"] + 1e-6)
-    ).clip(0, 1.2)
-
-    # Generation shortfall vs availability (degradation signal)
-    df["generation_shortfall_mw"] = (
-        df["availability_mw"] - df["actual_generation_mw"]
-    ).clip(lower=0)
-
-    # Net availability after curtailment (what could theoretically be dispatched)
-    df["net_availability_mw"] = (
-        df["availability_mw"] - df["curtailment_mw"]
-    ).clip(lower=0)
-
-    # Health-adjusted capacity (theoretical max given machine state)
-    df["health_adjusted_capacity_mw"] = df["capacity_mw"] * df["health_factor"]
-
-    # Boolean: is plant in degraded state (health < 75%)
-    df["is_degraded"] = (df["health_factor"] < 0.75).astype(int)
-
-    # Boolean: is plant likely in repair/offline (health < 55%)
-    df["is_offline"]  = (df["health_factor"] < 0.55).astype(int)
-
-    print("[OK] Derived base columns added")
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 9 — OPTIONAL PER-PLANT NORMALISATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def normalise_per_plant(
-    df: pd.DataFrame,
-    method: str = "capacity",   # "capacity" | "zscore" | "minmax" | "none"
-) -> pd.DataFrame:
-    """
-    Cross-plant ML models need generation on a comparable scale.
-    A 20 MW plant generating 15 MW is very different from a 200 MW plant
-    generating 15 MW.
-
-    method='capacity'  → divide by capacity_mw (default, most interpretable)
-    method='zscore'    → per-plant z-score (mean=0, std=1)
-    method='minmax'    → per-plant 0–1 scaling
-    method='none'      → skip (if training per-plant models)
-    """
-    if method == "none":
-        print("[SKIP] Per-plant normalisation skipped")
-        return df
-
-    if method == "capacity":
-        df["generation_norm"] = df["generation"] / (df["capacity_mw"] + 1e-6)
-
-    elif method == "zscore":
-        stats = df.groupby("plant_id")["generation"].agg(["mean", "std"]).reset_index()
-        stats.columns = ["plant_id", "gen_mean", "gen_std"]
-        df = df.merge(stats, on="plant_id", how="left")
-        df["generation_norm"] = (df["generation"] - df["gen_mean"]) / (df["gen_std"] + 1e-6)
-        df.drop(columns=["gen_mean", "gen_std"], inplace=True)
-
-    elif method == "minmax":
-        stats = df.groupby("plant_id")["generation"].agg(["min", "max"]).reset_index()
-        stats.columns = ["plant_id", "gen_min", "gen_max"]
-        df = df.merge(stats, on="plant_id", how="left")
-        df["generation_norm"] = (
-            (df["generation"] - df["gen_min"]) / (df["gen_max"] - df["gen_min"] + 1e-6)
-        )
-        df.drop(columns=["gen_min", "gen_max"], inplace=True)
-
-    print(f"[OK] Per-plant normalisation: {method}")
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 10 — FINAL DTYPE OPTIMISATION
+# STEP 8 — FINAL DTYPE OPTIMISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def optimise_dtypes(df: pd.DataFrame) -> pd.DataFrame:
@@ -514,7 +379,7 @@ def optimise_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 11 — QA REPORT
+# STEP 9 — QA REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def qa_report(df: pd.DataFrame) -> None:
@@ -529,7 +394,7 @@ def qa_report(df: pd.DataFrame) -> None:
     print(f"  Null values    : {df.isnull().sum().sum()}")
     print(f"  Duplicate rows : {df.duplicated().sum()}")
     print(f"\n  Numeric summary:")
-    key_cols = ["actual_generation_mw", "capacity_factor", "health_factor",
+    key_cols = ["generation", "capacity_factor", "health_factor",
                 "irradiance", "temperature", "wind_speed"]
     key_cols = [c for c in key_cols if c in df.columns]
     print(df[key_cols].describe().round(3).to_string())
@@ -539,12 +404,11 @@ def qa_report(df: pd.DataFrame) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API — Single entry point
 # ══════════════════════════════════════════════════════════════════════════════
-
 def preprocess(
     df: pd.DataFrame,
     outlier_method: str = "iqr",
-    normalise_method: str = "capacity",
     run_qa: bool = True,
+    is_forecast: bool = False,     
 ) -> pd.DataFrame:
     """
     Full pre-processing pipeline. Run this before build_features().
@@ -555,29 +419,23 @@ def preprocess(
     outlier_method   : "iqr" | "zscore" | "none"
     normalise_method : "capacity" | "zscore" | "minmax" | "none"
     run_qa           : Print QA report at end
+    is_forecast      : If True, drops generation before processing
+                       (use when passing forecast_df at inference time)
 
     Returns
     -------
     pd.DataFrame : Clean, transformed dataframe ready for feature engineering
-
-    Example
-    -------
-    >>> df_clean = preprocess(df_raw)
-    >>> df_features = build_features(df_clean, plant_type="Solar", capacity_kw=50_000)
     """
     print("\n" + "─"*60)
     print("  STARTING PRE-PROCESSING PIPELINE")
     print("─"*60)
 
-    df = validate_schema(df)
+    df = validate_schema(df, is_forecast=is_forecast)
     df = resolve_irradiance(df)
     df = cast_numeric(df)
     df = enforce_physical_bounds(df)
-    df = impute_missing(df)
+    df = impute_missing(df, is_forecast=is_forecast)
     df = treat_outliers(df, method=outlier_method)
-    df = encode_categoricals(df)
-    df = add_derived_base_columns(df)
-    df = normalise_per_plant(df, method=normalise_method)
     df = optimise_dtypes(df)
 
     if run_qa:
@@ -586,50 +444,3 @@ def preprocess(
     print("  PRE-PROCESSING COMPLETE")
     print("─"*60 + "\n")
     return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# USAGE EXAMPLE
-# ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import pandas as pd
-
-    # ── Load raw data ──
-    gen     = pd.read_csv("data/generation_raw.csv")
-    weather = pd.read_csv("data/weather_raw.csv")
-    pm      = pd.read_csv("data/plant_master.csv")
-
-    # ── Join generation + weather on timestamp + region ──
-    # (match plant to its regional weather zone)
-    gen = gen.merge(pm[["plant_id", "region"]], on="plant_id", how="left")
-    gen = gen.merge(
-        weather[["timestamp", "region", "temperature_c", "cloud_cover_pct",
-                 "wind_speed_kmh", "wind_direction_deg"]],
-        on=["timestamp", "region"],
-        how="left",
-    ).rename(columns={
-        "temperature_c":    "temperature",
-        "cloud_cover_pct":  "cloud_cover",
-        "wind_speed_kmh":   "wind_speed",
-        "wind_direction_deg": "wind_direction",
-    })
-
-    # ── Split timestamp → year/month/day/hour (as your schema has them) ──
-    gen["timestamp"] = pd.to_datetime(gen["timestamp"])
-    gen["year"]  = gen["timestamp"].dt.year
-    gen["month"] = gen["timestamp"].dt.month
-    gen["day"]   = gen["timestamp"].dt.day
-    gen["hour"]  = gen["timestamp"].dt.hour
-
-    # ── Run preprocessing ──
-    df_clean = preprocess(gen)
-
-    print("Columns after preprocessing:")
-    print(df_clean.columns.tolist())
-    print(f"\nReady for feature engineering: {df_clean.shape}")
-
-    # ── Now pass to FE pipeline ──
-    # from feature_engineering import build_features
-    # df_solar = df_clean[df_clean["plant_type"]=="Solar"].copy()
-    # df_fe = build_features(df_solar, "Solar", capacity_kw=50_000)

@@ -90,9 +90,12 @@ except ImportError:
     HAS_XGB = False
     print("[WARN] xgboost not installed — pip install xgboost")
 
-TARGET   = "generation"   # column we forecast — present in both dfs
+TARGET   = "generation"   # internal name used throughout this file
 HORIZON  = 72             # hours ahead
 VAL_DAYS = 14             # default walk-forward validation window
+
+# Accepted names for the target column (either is fine on input)
+_TARGET_ALIASES = {"generation", "actual_generation_mw"}
 
 # Minimum required columns — both dfs share the same schema
 REQUIRED_COLS = {"plant_id", "timestamp", "generation"}
@@ -170,6 +173,7 @@ def merge_for_multivariate(
     -------
     pd.DataFrame with all original columns + is_forecast flag.
     """
+    historical_df = _rename_target(historical_df)
     _validate_cols(historical_df, "historical_df")
     _validate_cols(forecast_df,   "forecast_df")
 
@@ -213,13 +217,27 @@ def merge_for_multivariate(
     return extended
 
 
+def _rename_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise target column name to 'generation'.
+    Accepts 'actual_generation_mw' or 'generation' on input.
+    forecast_df will never have the target — that is fine.
+    """
+    if "actual_generation_mw" in df.columns and "generation" not in df.columns:
+        df = df.rename(columns={"actual_generation_mw": "generation"})
+    return df
+
+
 def _validate_cols(df: pd.DataFrame, name: str) -> None:
-    missing = REQUIRED_COLS - set(df.columns)
+    # forecast_df has no target — only require plant_id + timestamp for it
+    has_target = "generation" in df.columns or "actual_generation_mw" in df.columns
+    cols_needed = REQUIRED_COLS if has_target else {"plant_id", "timestamp"}
+    missing = cols_needed - set(df.columns)
     if missing:
         raise ValueError(
             f"[Validate] {name} missing required columns: {missing}\n"
-            f"  Both historical_df_solar and forecast_df_solar must have: "
-            f"{sorted(REQUIRED_COLS)}\n"
+            f"  historical_df needs: {sorted(REQUIRED_COLS)}\n"
+            f"  forecast_df needs: ['plant_id', 'timestamp'] (no target column)\n"
             f"  Got: {sorted(df.columns.tolist())}"
         )
 
@@ -952,6 +970,7 @@ def run_multivariate_fleet(
     OUT = Path(output_dir)
     OUT.mkdir(parents=True, exist_ok=True)
 
+    historical_df = _rename_target(historical_df)
     _validate_cols(historical_df, "historical_df")
     _validate_cols(forecast_df,   "forecast_df")
 
@@ -1114,4 +1133,3 @@ def run_decomposition_only(
     >>> print(hard[["plant_id", "residual_std"]].to_string())
     """
     return decompose_fleet(historical_df, output_csv=output_csv)
-
