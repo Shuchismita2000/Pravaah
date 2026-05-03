@@ -1,0 +1,10 @@
+plant_id,error
+PLANT_013,"ValueError: Too few training rows: 0 (need ≥500)
+Traceback (most recent call last):
+  File ""d:\Portfolio Github\Pravaah\src\multivariate.py"", line 880, in _process_one_plant
+    result = select_best_multivariate_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""d:\Portfolio Github\Pravaah\src\multivariate.py"", line 679, in select_best_multivariate_model
+    raise ValueError(f""Too few training rows: {len(train_df)} (need ≥500)"")
+ValueError: Too few training rows: 0 (need ≥500)
+"

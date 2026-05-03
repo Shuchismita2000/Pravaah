@@ -1,0 +1,2 @@
+plant_id,best_model,lightgbm_MAE,lightgbm_MAPE,xgboost_MAE,xgboost_MAPE,ridge_MAE,ridge_MAPE,svr_MAE,svr_MAPE,seasonal_strength,weekly_strength,trend_strength,residual_std,dominant_period,forecast_difficulty
+PLANT_003,ridge,0.077,0.46,0.079,0.47,0.005,0.04,0.369,2.7,0.9091,0.8883,0.3214,2.7734,daily,easy
