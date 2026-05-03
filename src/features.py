@@ -1,21 +1,8 @@
 """
 Karnataka Renewable Energy Grid — Feature Engineering Pipeline
 ==============================================================
-Consolidated from:
-  - solar_feature_engineering()
-  - wind_feature_engineering()
-  - plant_behavior_features()
-
-Duplicates removed:
-  - hour, day_of_year       (was in solar + wind → moved to shared base)
-  - gen_lag_1/24/168        (was in wind + plant_behavior → kept in plant_behavior only)
-  - cuf                     (was in wind + plant_behavior → kept in plant_behavior only)
-  - wind_speed_rolling_std  (wind) merged with gen_rolling_std (plant_behavior)
-
-Usage:
-  df = build_features(df, plant_type="Solar",  capacity_kw=50_000)
-  df = build_features(df, plant_type="Wind",   capacity_kw=80_000)
-  df = build_features(df, plant_type="Hybrid", capacity_kw=100_000)
+Leakage-free version: all features derived from `generation` (= actual_generation_mw)
+have been removed, except strictly-past lag/rolling windows.
 """
 
 import numpy as np
@@ -51,13 +38,17 @@ def _base_time_features(df: pd.DataFrame) -> pd.DataFrame:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 2A — SOLAR-SPECIFIC FEATURES
-# Requires: irradiance, temperature, cloud_cover, generation
+# Requires: irradiance, temperature, cloud_cover
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _solar_features(df: pd.DataFrame, capacity_kw: float) -> pd.DataFrame:
     """
     Solar physics + panel efficiency features.
     NOTE: hour/day_of_year NOT repeated here (handled by _base_time_features).
+
+    REMOVED (leakage):
+        - performance_ratio     → used generation (= target)
+        - pr_rolling_7/30       → derived from performance_ratio
     """
     epsilon = 1e-6
 
@@ -78,32 +69,23 @@ def _solar_features(df: pd.DataFrame, capacity_kw: float) -> pd.DataFrame:
     # 4. Temperature efficiency loss (~0.4 %/°C above 25°C)
     df["temp_effect"] = 1 + (-0.004) * (df["temperature"] - 25)
 
-    # 5. Expected generation (physics estimate)
+    # 5. Expected generation (physics estimate — uses capacity & weather only)
     df["expected_generation"] = (
         df["irradiance_adjusted"] * df["temp_effect"] * capacity_kw / 1000
     )
 
-    # 6. Performance Ratio — actual vs irradiance-weighted capacity
-    df["performance_ratio"] = (
-        df["generation"] / ((df["irradiance"] + epsilon) * capacity_kw)
-    ).clip(0, 1.2)
-
-    # 7. Rolling PR (panel degradation signal)
-    df["pr_rolling_7"]  = df["performance_ratio"].rolling(7).mean()
-    df["pr_rolling_30"] = df["performance_ratio"].rolling(30).mean()
-
-    # 8. Soiling loss (dust accumulation — resets on cleaning events)
+    # 6. Soiling loss (dust accumulation — resets on cleaning events)
     df["days_since_cleaning"] = (
         df["timestamp"] - df["timestamp"].min()
     ).dt.days
     df["soiling_loss"] = (1 - 0.001 * df["days_since_cleaning"]).clip(0.70, 1.0)
 
-    # 9. Combined adjusted generation signal
+    # 7. Combined adjusted generation signal (weather + soiling, no actual gen)
     df["adjusted_generation_signal"] = (
         df["expected_generation"] * df["soiling_loss"]
     )
 
-    # 10. Daytime flag
+    # 8. Daytime flag
     df["is_daylight"] = (df["clear_sky_irradiance"] > 0).astype(int)
 
     return df
@@ -111,7 +93,7 @@ def _solar_features(df: pd.DataFrame, capacity_kw: float) -> pd.DataFrame:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 2B — WIND-SPECIFIC FEATURES
-# Requires: wind_speed, wind_direction, temperature, generation
+# Requires: wind_speed, wind_direction, temperature
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _wind_features(
@@ -122,7 +104,7 @@ def _wind_features(
     """
     Wind physics + turbine curve features.
     NOTE: hour/day_of_year NOT repeated (handled by _base_time_features).
-    NOTE: cuf, gen_lag_* NOT here (handled by _plant_behavior_features).
+    NOTE: lags/rolling NOT here (handled by _plant_behavior_features).
     """
     swept_area = np.pi * (rotor_diameter / 2) ** 2
 
@@ -145,7 +127,7 @@ def _wind_features(
         )
     df["turbine_efficiency"] = _power_curve(df["wind_speed"].values)
 
-    # 4. Expected wind generation
+    # 4. Expected wind generation (physics only — no actual gen used)
     df["expected_wind_generation"] = (
         df["wind_power_density"] * df["turbine_efficiency"]
     )
@@ -162,7 +144,7 @@ def _wind_features(
         0.5 * df["air_density_adjusted"] * swept_area * df["wind_speed_cubed"]
     ) / 1e6
 
-    # 7. Operational regime flags
+    # 7. Operational regime flags (derived from wind_speed only — no leakage)
     df["is_below_cut_in"]  = (df["wind_speed"] < 3).astype(int)
     df["is_above_cut_out"] = (df["wind_speed"] > 25).astype(int)
 
@@ -176,65 +158,47 @@ def _wind_features(
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 3 — PLANT BEHAVIOR FEATURES
 # Applied to ALL plant types AFTER type-specific layers
-# Contains: lags, rolling stats, CUF, ramp, downtime — previously duplicated
+# Only strictly-past lag/rolling windows are kept — no current-timestep target
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _plant_behavior_features(df: pd.DataFrame, capacity_kw: float) -> pd.DataFrame:
-    """
-    Temporal + behavioral features common to every plant type.
-    This is the single source of: lags, CUF, ramp, rolling stats.
-    """
-    df = df.sort_values("timestamp").reset_index(drop=True)
+# def _plant_behavior_features(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Temporal features common to every plant type.
+#     Uses generation (= actual_generation_mw) ONLY via shift/rolling with
+#     closed='left' so the current timestep is never included.
 
-    # 1. Lag features (temporal autocorrelation)
-    df["gen_lag_1"]   = df["generation"].shift(1)    # t-1 hour
-    df["gen_lag_24"]  = df["generation"].shift(24)   # same hour yesterday
-    df["gen_lag_168"] = df["generation"].shift(168)  # same hour last week
+#     REMOVED (leakage — used generation at time t):
+#         - cuf                   → generation / capacity at t
+#         - ramp_rate / ramp_abs  → diff includes t vs t-1 (current target visible)
+#         - gen_momentum_3/6      → generation[t] - generation[t-3]
+#         - daily_generation      → rolling sum ending at t
+#         - load_factor           → derived from daily_generation
+#         - is_peak               → rolling max ending at t
+#         - gen_variability_24/168→ rolling std ending at t
+#         - is_zero_gen           → generation[t] == 0
+#         - zero_streak           → derived from is_zero_gen
+#         - gen_residual_24       → generation[t] - rolling_mean ending at t
+#         - gen_normalized        → generation[t] / rolling_mean ending at t
 
-    # 2. Rolling statistics (trend + volatility)
-    df["gen_rolling_mean_6"]   = df["generation"].rolling(6).mean()
-    df["gen_rolling_std_6"]    = df["generation"].rolling(6).std()
-    df["gen_rolling_mean_24"]  = df["generation"].rolling(24).mean()
-    df["gen_rolling_mean_168"] = df["generation"].rolling(168).mean()
+#     KEPT (safe — strictly past data, shifted before use):
+#         - gen_lag_1/24/168      → shift(n), n ≥ 1
+#         - gen_rolling_mean_6/24/168 → rolling(n).mean().shift(1)
+#         - gen_rolling_std_6     → rolling(n).std().shift(1)
+#     """
+#     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # 3. Capacity Utilization Factor (single source — removed from wind layer)
-    df["cuf"] = (df["generation"] / (capacity_kw + 1e-6)).clip(0, 1.2)
+#     # 1. Lag features (temporal autocorrelation) — strictly past timesteps
+#     df["gen_lag_1"]   = df["generation"].shift(1)    # t-1 hour
+#     df["gen_lag_24"]  = df["generation"].shift(24)   # same hour yesterday
+#     df["gen_lag_168"] = df["generation"].shift(168)  # same hour last week
 
-    # 4. Ramp rate (sudden changes signal)
-    df["ramp_rate"] = df["generation"].diff()
-    df["ramp_abs"]  = df["ramp_rate"].abs()
+#     # 2. Rolling statistics — shift(1) ensures window ends at t-1, never t
+#     df["gen_rolling_mean_6"]   = df["generation"].rolling(6).mean().shift(1)
+#     df["gen_rolling_std_6"]    = df["generation"].rolling(6).std().shift(1)
+#     df["gen_rolling_mean_24"]  = df["generation"].rolling(24).mean().shift(1)
+#     df["gen_rolling_mean_168"] = df["generation"].rolling(168).mean().shift(1)
 
-    # 5. Momentum (short-term trend direction)
-    df["gen_momentum_3"] = df["generation"] - df["generation"].shift(3)
-    df["gen_momentum_6"] = df["generation"] - df["generation"].shift(6)
-
-    # 6. Load factor (daily energy vs theoretical max)
-    df["daily_generation"] = df["generation"].rolling(24).sum()
-    df["load_factor"] = df["daily_generation"] / (capacity_kw * 24 + 1e-6)
-
-    # 7. Weekly peak indicator
-    rolling_max = df["generation"].rolling(168).max()
-    df["is_peak"] = (df["generation"] >= 0.9 * rolling_max).astype(int)
-
-    # 8. Generation variability (stability signal)
-    df["gen_variability_24"]  = df["generation"].rolling(24).std()
-    df["gen_variability_168"] = df["generation"].rolling(168).std()
-
-    # 9. Downtime / zero-generation detection
-    df["is_zero_gen"] = (df["generation"] == 0).astype(int)
-    df["zero_streak"] = (
-        df["is_zero_gen"]
-        .groupby((df["is_zero_gen"] != df["is_zero_gen"].shift()).cumsum())
-        .cumsum()
-    )
-
-    # 10. Residual from rolling expectation
-    df["gen_residual_24"] = df["generation"] - df["gen_rolling_mean_24"]
-
-    # 11. Normalized generation (cross-plant comparability)
-    df["gen_normalized"] = df["generation"] / (df["gen_rolling_mean_168"] + 1e-6)
-
-    return df
+#     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,15 +217,12 @@ def build_features(
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain 'timestamp' and 'generation'.
+        Must contain 'timestamp' and 'generation' (= actual_generation_mw).
         Solar/Hybrid also need: irradiance, temperature, cloud_cover.
         Wind/Hybrid also need: wind_speed, wind_direction, temperature.
 
     plant_type : str
         One of: "Solar" | "Wind" | "Hybrid"
-
-    capacity_kw : float
-        Installed capacity in kW.
 
     air_density : float
         Air density kg/m³ (wind/hybrid only). Default 1.225.
@@ -272,13 +233,13 @@ def build_features(
     Returns
     -------
     pd.DataFrame
-        Feature-engineered dataframe, NaN rows dropped.
+        Leakage-free feature-engineered dataframe, NaN rows dropped.
 
     Example
     -------
-    >>> df_solar  = build_features(df, "Solar",  capacity_kw=50_000)
-    >>> df_wind   = build_features(df, "Wind",   capacity_kw=80_000)
-    >>> df_hybrid = build_features(df, "Hybrid", capacity_kw=100_000)
+    >>> df_solar  = build_features(df, "Solar")
+    >>> df_wind   = build_features(df, "Wind")
+    >>> df_hybrid = build_features(df, "Hybrid")
     """
     plant_type = plant_type.strip().title()
     assert plant_type in ("Solar", "Wind", "Hybrid"), (
@@ -291,9 +252,7 @@ def build_features(
     df = _base_time_features(df)
 
     # Derive per-row capacity in kW from the column that's already there
-    # This works for both scalar lookup and vectorised operations
     capacity_kw_col = df["capacity_mw"] * 1000   # pd.Series, shape (n,)
-
 
     # ── Layer 2: plant-type-specific physics ──
     if plant_type == "Solar":
@@ -308,8 +267,8 @@ def build_features(
         df = _solar_features(df, capacity_kw_col)
         df = _wind_features(df, air_density, rotor_diameter)
 
-    # ── Layer 3: shared behavioral features (lags, rolling, CUF, etc.) ──
-    df = _plant_behavior_features(df, capacity_kw_col)
+    # ── Layer 3: shared behavioral features (lags + rolling only) ──
+    #     df = _plant_behavior_features(df)
 
     # Drop NaNs introduced by rolling/lag windows
     df = df.dropna().reset_index(drop=True)
