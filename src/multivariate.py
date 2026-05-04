@@ -887,7 +887,7 @@ def _process_one_plant(
             ).strip().lower().replace(" ", "_")
 
         # ── Save model ──────────────────────────────
-        model = result.get("model")
+        model = result.get("final_model")
         if model is not None:
             ts = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -1127,7 +1127,7 @@ def run_single_plant(
         cap_mw = float(historical_df.loc[mask, "capacity_mw"].iloc[0])
 
      # ── Save model ───────────────────────────────
-    model = result.get("model", None)
+    model = result.get("final_model", None)
     if model is not None:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
 

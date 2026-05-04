@@ -229,8 +229,10 @@ def forecast_availability_one_plant(
     # Capacity baseline — always compute (used for blend)
     baseline_fc = _capacity_baseline_forecast(capacity_mw, horizon)
 
+    prophet_model = None
+
     if best == "prophet" and HAS_PROPHET:
-        _, fc_df_full = _prophet_availability_forecast(series, capacity_mw, horizon)
+        prophet_model, fc_df_full = _prophet_availability_forecast(series, capacity_mw, horizon)
         prophet_fc    = fc_df_full["yhat"].values
         fc_lower      = fc_df_full["yhat_lower"].clip(lower=0).values
         fc_upper      = fc_df_full["yhat_upper"].clip(upper=capacity_mw).values
@@ -263,12 +265,12 @@ def forecast_availability_one_plant(
           f"| Capacity: {capacity_mw:.1f} MW")
 
     return {
-        "plant_id":    plant_id,
-        "scores":      results,
-        "best_model":  best,
-        "forecast_df": forecast_df,
+    "plant_id":    plant_id,
+    "scores":      results,
+    "best_model":  best,
+    "forecast_df": forecast_df,
+    "prophet_model": prophet_model,
     }
-
 
 # ══════════════════════════════════════════════════════════════════════
 # PART 3 — DATA PREPARATION
@@ -361,22 +363,23 @@ def _availability_worker(plant_id, plant_df, horizon):
             plant_id, series, capacity_mw, horizon
         )
                 # ── Save model ───────────────────────────────
-        model = result.get("model", None)
-        if model is not None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
-            model_path = MODEL_DIR / f"{plant_id}_availability_model_{ts}.joblib"
+        prophet_model = result.get("prophet_model", None)
+        best_model    = result.get("best_model")
 
-            joblib.dump(
-                {
-                    "model": model,
-                    "plant_id": plant_id,
-                    "capacity_mw": float(capacity_mw),
-                    "horizon": horizon,
-                    "model_name": result.get("best_model"),
-                },
-                model_path,
-                compress=3,
-            )
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        model_path = MODEL_DIR / f"{plant_id}_availability_model_{ts}.joblib"
+
+        joblib.dump(
+            {
+                "prophet_model": prophet_model,   # may be None
+                "best_model": best_model,
+                "plant_id": plant_id,
+                "capacity_mw": float(capacity_mw),
+                "horizon": horizon,
+            },
+            model_path,
+            compress=3,
+        )
         return {"status": "ok", "plant_id": plant_id,
                 "forecast_df": result["forecast_df"],
                 "best_model":  result["best_model"]}

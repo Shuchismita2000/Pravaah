@@ -351,7 +351,7 @@ def _irradiance_worker(plant_id, plant_df, plant_meta, horizon):
         )
 
         # ── Save model ───────────────────────────────
-        model = result.get("model", None)
+        model = result.get("best_model")
         if model is not None:
             ts = datetime.now().strftime("%Y%m%d_%H%M")
             model_path = MODEL_DIR / f"{plant_id}_irradiance_model_{ts}.joblib"

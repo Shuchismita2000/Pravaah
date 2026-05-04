@@ -393,11 +393,14 @@ def forecast_curtailment_one_plant(
           f"curtailed hours={int((curt_prob > 0.5).sum())}/72")
 
     return {
-        "plant_id":          plant_id,
-        "classifier_metrics": clf_metrics,
-        "regressor_metrics":  reg_metrics,
-        "forecast_df":        forecast_df,
-    }
+    "plant_id": plant_id,
+    "classifier_metrics": clf_metrics,
+    "regressor_metrics": reg_metrics,
+    "forecast_df": forecast_df,
+    "classifier_model": clf,
+    "regressor_model": reg,
+    "fallback_mean": fallback_mean,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -573,23 +576,30 @@ def _process_curtailment_one_plant(
             plant_id, plant_df, future_df, val_days
         )
          # ── Save model ───────────────────────────────
-        model = result.get("model", None)
-        if model is not None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
-            model_path = MODEL_DIR / f"{plant_id}_curtailment_model_{ts}.joblib"
+        clf = result.get("classifier_model")
+        reg = result.get("regressor_model")
+        fallback_mean = result.get("fallback_mean")
 
-            joblib.dump(
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+        model_path = MODEL_DIR / f"{plant_id}_curtailment_model_{ts}.joblib"
+
+        joblib.dump(
                 {
-                    "model": model,
+                    "classifier": clf,
+                    "regressor": reg,
+                    "fallback_mean": fallback_mean,
                     "plant_id": plant_id,
                     "plant_type": plant_type,
                     "capacity_mw": float(capacity_mw),
                     "val_days": val_days,
+                    "features": CURTAILMENT_FEATURES,
                 },
                 model_path,
                 compress=3,
-            )
+            )      
 
+            
         # ── Return success result ────────────────────
         return {
             "status": "ok",
