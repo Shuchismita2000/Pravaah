@@ -11,11 +11,13 @@ availability_mw:
 """
 
 import warnings
+import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from joblib import Parallel, delayed
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
@@ -26,15 +28,16 @@ except ImportError:
     HAS_PROPHET = False
     print("[WARN] prophet not installed — availability will use capacity baseline only")
 
-OUT_DIR = Path("data/forecasts")
+OUT_DIR   = Path("data/forecasts")
+MODEL_DIR = Path("models/availability")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SHARED UTILITIES  (mirrors irradiance.py exactly)
+# SHARED UTILITIES
 # ══════════════════════════════════════════════════════════════════════
 
 def _time_split(series: pd.Series, val_hours: int = 168):
-    """Split on time boundary — never shuffle."""
     train = series.iloc[:-val_hours]
     val   = series.iloc[-val_hours:]
     return train, val
@@ -59,44 +62,7 @@ def _evaluate(actual: np.ndarray, predicted: np.ndarray, name: str) -> dict:
 # PART 1 — AVAILABILITY FORECAST
 # ══════════════════════════════════════════════════════════════════════
 
-"""
-AVAILABILITY CHARACTERISTICS:
-  - Hard upper bound: capacity_mw (never exceeds installed capacity)
-  - Hard lower bound: 0 (full outage)
-  - Typical pattern: stays near capacity_mw, drops sharply during outages,
-    recovers immediately after maintenance completes
-  - Weekly cycle: planned maintenance often on weekends / fixed days
-  - Yearly cycle: monsoon season (Jun–Sep) sees more maintenance windows
-                  in Karnataka (lower generation → good time to maintain)
-  - Zero-inflation: forced outages cause sudden zeros (not predictable,
-    but rolling history captures plant-specific reliability patterns)
-
-WHAT TO FORECAST:
-  We forecast availability_mw directly (not as a fraction).
-  Capacity baseline: assume full availability = capacity_mw.
-  Prophet learns departures from full availability (planned outages,
-  maintenance windows) from historical patterns.
-
-  Final forecast is clipped to [0, capacity_mw] per plant.
-"""
-
-
-def _capacity_baseline_forecast(
-    capacity_mw: float,
-    n_periods: int,
-) -> np.ndarray:
-    """
-    Simplest possible baseline: assume full availability at all times.
-
-    This is surprisingly strong for plants with high reliability (>95% uptime).
-    Acts as the upper-bound anchor in the blend, equivalent to how
-    physics_irradiance anchors the irradiance forecast.
-
-    Parameters
-    ----------
-    capacity_mw : float   installed capacity of the plant
-    n_periods   : int     number of hourly timesteps to fill
-    """
+def _capacity_baseline_forecast(capacity_mw: float, n_periods: int) -> np.ndarray:
     return np.full(n_periods, capacity_mw, dtype=float)
 
 
@@ -105,48 +71,25 @@ def _prophet_availability_forecast(
     capacity_mw: float,
     horizon: int,
 ) -> tuple:
-    """
-    Prophet model for availability_mw.
-
-    Key config differences from irradiance:
-    - seasonality_mode='additive': outage drops are absolute MW, not scaled
-    - weekly_seasonality=True: maintenance has strong day-of-week pattern
-    - yearly_seasonality=True: monsoon maintenance windows
-    - No daily_seasonality: availability doesn't follow a daily solar arc
-    - logistic growth with cap=capacity_mw to respect physical upper bound
-    - changepoint_prior_scale higher than irradiance (outages are abrupt)
-
-    Returns: (model, forecast_df)
-    """
     if not HAS_PROPHET:
         raise ImportError("prophet not installed")
 
     df = train.reset_index()
     df.columns = ["ds", "y"]
-
-    # Logistic growth keeps forecast ≤ capacity_mw
     df["floor"] = 0.0
     df["cap"]   = float(capacity_mw)
 
     model = Prophet(
         growth="logistic",
-        daily_seasonality=False,          # no daily arc unlike irradiance
-        weekly_seasonality=True,          # maintenance has weekly pattern
-        yearly_seasonality=True,          # monsoon maintenance windows
-        seasonality_mode="additive",      # outage drops are in MW not fractions
-        changepoint_prior_scale=0.05,     # more flexible than irradiance (abrupt outages)
-        seasonality_prior_scale=10.0,     # allow stronger weekly/yearly swings
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=True,
+        seasonality_mode="additive",
+        changepoint_prior_scale=0.05,
+        seasonality_prior_scale=10.0,
         interval_width=0.90,
     )
-
-    # Add a custom monthly seasonality to capture maintenance planning cycles
-    model.add_seasonality(
-        name="monthly",
-        period=30.5,
-        fourier_order=5,
-        mode="additive",
-    )
-
+    model.add_seasonality(name="monthly", period=30.5, fourier_order=5, mode="additive")
     model.fit(df)
 
     future = model.make_future_dataframe(periods=horizon, freq="h")
@@ -154,108 +97,82 @@ def _prophet_availability_forecast(
     future["cap"]   = float(capacity_mw)
 
     forecast = model.predict(future)
-    # Hard clip to physical bounds
     forecast["yhat"] = forecast["yhat"].clip(lower=0, upper=capacity_mw)
     return model, forecast.tail(horizon).reset_index(drop=True)
 
 
 def forecast_availability_one_plant(
     plant_id: str,
-    series: pd.Series,           # hourly availability_mw with DatetimeIndex
-    capacity_mw: float,          # installed capacity — hard upper bound
+    series: pd.Series,
+    capacity_mw: float,
     horizon: int = 72,
     val_hours: int = 168,
 ) -> dict:
-    """
-    Forecast availability_mw for one plant for the next `horizon` hours.
-
-    Strategy (mirrors irradiance.py):
-      1. Capacity baseline — assume full availability (always available)
-      2. Prophet           — learns planned outage / maintenance patterns
-      3. Pick winner on MAE on validation set
-      4. Blend: winner × 0.7 + capacity_baseline × 0.3
-         (baseline anchors forecast to capacity, Prophet adjusts for outages)
-
-    Why blend:
-      Prophet can over-predict outage depth on unseen periods.
-      Capacity baseline is always a reasonable upper anchor.
-      Blending gives conservative, stable forecasts for grid planning.
-
-    Physical constraints enforced:
-      - forecast clipped to [0, capacity_mw]
-      - no negative availability
-
-    Returns
-    -------
-    dict with keys: plant_id, scores, best_model, forecast_df
-    forecast_df columns: plant_id, timestamp, availability_forecast,
-                         lower_90, upper_90, method
-    """
     print(f"\n  [{plant_id}] Availability forecast ({len(series):,} obs, "
           f"capacity={capacity_mw:.1f} MW)...")
 
-    # Physical constraint — availability can't exceed capacity
     series = series.clip(lower=0, upper=capacity_mw)
     train, val = _time_split(series, val_hours)
 
     results = {}
 
-    # ── 1. Capacity baseline ──────────────────────────────────────────
+    # ── 1. Capacity baseline ──────────────────────────────────────
     baseline_val = _capacity_baseline_forecast(capacity_mw, len(val))
     results["capacity_baseline"] = _evaluate(val.values, baseline_val, "capacity baseline")
 
-    # ── 2. Prophet ────────────────────────────────────────────────────
+    # ── 2. Prophet ────────────────────────────────────────────────
+    prophet_model  = None
     prophet_val_fc = None
     if HAS_PROPHET:
         try:
-            _, prophet_val_df = _prophet_availability_forecast(
+            prophet_model, prophet_val_df = _prophet_availability_forecast(
                 train, capacity_mw, horizon=val_hours
             )
             prophet_val_fc     = prophet_val_df["yhat"].values
             results["prophet"] = _evaluate(val.values, prophet_val_fc, "prophet")
         except Exception as e:
             print(f"    Prophet failed: {e}")
+            prophet_model = None
 
-    # ── Pick winner ───────────────────────────────────────────────────
+    # ── Pick winner ───────────────────────────────────────────────
     best = min(results, key=lambda m: results[m]["MAE"])
     print(f"    Winner: {best} (MAE={results[best]['MAE']:.3f})")
 
-    # ── Forecast on full series ───────────────────────────────────────
+    # ── Forecast on full series ───────────────────────────────────
     forecast_timestamps = pd.date_range(
         start=series.index[-1] + pd.Timedelta(hours=1),
         periods=horizon, freq="h",
     )
 
-    # Capacity baseline — always compute (used for blend)
     baseline_fc = _capacity_baseline_forecast(capacity_mw, horizon)
 
-    prophet_model = None
-
     if best == "prophet" and HAS_PROPHET:
+        # Re-fit on full series to get the final model object
         prophet_model, fc_df_full = _prophet_availability_forecast(series, capacity_mw, horizon)
-        prophet_fc    = fc_df_full["yhat"].values
-        fc_lower      = fc_df_full["yhat_lower"].clip(lower=0).values
-        fc_upper      = fc_df_full["yhat_upper"].clip(upper=capacity_mw).values
-        # Blend: Prophet for outage patterns, baseline for capacity anchor
-        blended_fc    = 0.70 * prophet_fc + 0.30 * baseline_fc
+        prophet_fc = fc_df_full["yhat"].values
+        fc_lower   = fc_df_full["yhat_lower"].clip(lower=0).values.copy()
+        fc_upper   = fc_df_full["yhat_upper"].clip(upper=capacity_mw).values.copy()
+        blended_fc = 0.70 * prophet_fc + 0.30 * baseline_fc
+        method     = "blend_prophet_baseline"
     else:
-        blended_fc = baseline_fc
-        rmse       = results["capacity_baseline"]["RMSE"]
-        fc_lower   = np.maximum(0, blended_fc - 1.5 * rmse)
-        fc_upper   = np.minimum(capacity_mw, blended_fc + 1.5 * rmse)
+        prophet_model = None
+        blended_fc    = baseline_fc.copy()
+        rmse          = results["capacity_baseline"]["RMSE"]
+        fc_lower      = np.maximum(0, blended_fc - 1.5 * rmse)
+        fc_upper      = np.minimum(capacity_mw, blended_fc + 1.5 * rmse)
+        method        = "capacity_baseline"
 
-    # Hard physical constraints
     blended_fc = np.clip(blended_fc, 0, capacity_mw)
     fc_lower   = np.maximum(0, fc_lower)
     fc_upper   = np.minimum(capacity_mw, fc_upper)
 
     forecast_df = pd.DataFrame({
-        "plant_id":               plant_id,
-        "timestamp":              forecast_timestamps,
-        "availability_forecast":  np.round(blended_fc, 2),
-        "lower_90":               np.round(fc_lower,   2),
-        "upper_90":               np.round(fc_upper,   2),
-        "method":                 f"blend_{best}_baseline",
+        "plant_id":              plant_id,
+        "timestamp":             forecast_timestamps,
+        "availability_forecast": np.round(blended_fc, 2),
+        "lower_90":              np.round(fc_lower,   2),
+        "upper_90":              np.round(fc_upper,   2),
+        "method":                method,
     })
 
     uptime_pct = (blended_fc > 0).mean() * 100
@@ -265,35 +182,170 @@ def forecast_availability_one_plant(
           f"| Capacity: {capacity_mw:.1f} MW")
 
     return {
-    "plant_id":    plant_id,
-    "scores":      results,
-    "best_model":  best,
-    "forecast_df": forecast_df,
-    "prophet_model": prophet_model,
+        "plant_id":     plant_id,
+        "scores":       results,
+        "best_model":   best,
+        "model_obj":    prophet_model,   # fitted Prophet, or None for baseline
+        "val_rmse":     results[best]["RMSE"],
+        "capacity_mw":  capacity_mw,
+        "forecast_df":  forecast_df,
     }
 
+
 # ══════════════════════════════════════════════════════════════════════
-# PART 3 — DATA PREPARATION
+# PART 2 — WORKER + SAVE PKL
+# ══════════════════════════════════════════════════════════════════════
+def _availability_worker(plant_id, plant_df, horizon):
+    warnings.filterwarnings("ignore")
+    
+    # ── Forecast (keep existing try/except) ──────────────────────
+    try:
+        capacity_mw = plant_df["capacity_mw"].median()
+        series = (
+            plant_df.sort_values("timestamp")
+            .set_index("timestamp")["availability_mw"]
+            .asfreq("h")
+            .fillna(capacity_mw)
+            .clip(lower=0, upper=capacity_mw)
+        )
+        if len(series) < 500:
+            return {"status": "skip", "plant_id": plant_id,
+                    "error": f"only {len(series)} obs"}
+
+        result = forecast_availability_one_plant(plant_id, series, capacity_mw, horizon)
+
+    except Exception as e:
+        import traceback
+        return {"status": "error", "plant_id": plant_id,
+                "forecast_df": None,
+                "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"}
+
+    # ── Pkl save (separate try/except — never kills the forecast) ─
+    best = result["best_model"]
+    payload = {
+        "model_name":  best,
+        "model":       result["model_obj"] if best == "prophet" else None,
+        "plant_id":    plant_id,
+        "capacity_mw": float(result["capacity_mw"]),
+        "horizon":     horizon,
+        "val_rmse":    result["val_rmse"],
+    }
+    try:
+        ts         = datetime.now().strftime("%Y%m%d_%H%M")
+        model_path = MODEL_DIR / f"{plant_id}_availability_{ts}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(payload, f)
+        print(f"    Saved pkl → {model_path.name}")
+    except Exception as e:
+        print(f"    [WARN] pkl save failed for {plant_id}: {e}")
+        # Forecast result is still returned — don't re-raise
+
+    return {"status": "ok", "plant_id": plant_id,
+            "forecast_df": result["forecast_df"],
+            "best_model":  best}
+# ══════════════════════════════════════════════════════════════════════
+# PART 3 — PREDICT FROM SAVED PKL
 # ══════════════════════════════════════════════════════════════════════
 
-def prepare_availability_input(
-    merged_df: pd.DataFrame,
+def predict_availability(
+    pkl_path: str,
+    timestamps,           # pd.DatetimeIndex | pd.Series | list of datetime-like
+    horizon: int = None,  # fallback when timestamps=None
 ) -> pd.DataFrame:
     """
-    Prepare availability_mw series for forecasting.
+    Load a saved availability pkl and predict for the given timestamps.
 
-    Input : merged_df with timestamp, plant_id, availability_mw, capacity_mw
-    Output: clean df with timestamp, plant_id, availability_mw, capacity_mw
-            — physically bounded [0, capacity_mw], gaps forward-filled,
-              sorted per plant
+    Parameters
+    ----------
+    pkl_path   : path to .pkl saved by _availability_worker
+    timestamps : exact timestamps you want predictions for.
+                 Accepts pd.DatetimeIndex, pd.Series, or list of datetime-like.
+                 If None, builds `horizon` hours from now.
+    horizon    : only used when timestamps=None.
 
-    Gap-filling strategy:
-      - Short gaps (≤ 3h): forward-fill (availability held constant
-        until next reading — matches how SCADA systems report it)
-      - Longer gaps: fill with capacity_mw (assume available unless told otherwise)
-      This is conservative — better to over-estimate availability
-      than to inject phantom outages into training data.
+    Returns
+    -------
+    pd.DataFrame with columns:
+        plant_id, timestamp, availability_forecast, lower_90, upper_90, method
+
+    Example
+    -------
+    ts = pd.date_range("2026-06-01", periods=72, freq="h")
+    df = predict_availability("models/availability/PLANT_001_availability_20260505_1400.pkl", ts)
+
+    # or from a DataFrame column:
+    df = predict_availability(pkl_path, timestamps=my_df["timestamp"])
     """
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+
+    model_name  = payload["model_name"]
+    plant_id    = payload["plant_id"]
+    capacity_mw = payload["capacity_mw"]
+    val_rmse    = payload["val_rmse"]
+
+    # ── Resolve timestamps ────────────────────────────────────────
+    if timestamps is not None:
+        if isinstance(timestamps, pd.Series):
+            forecast_timestamps = pd.DatetimeIndex(pd.to_datetime(timestamps.values))
+        elif isinstance(timestamps, pd.DatetimeIndex):
+            forecast_timestamps = timestamps
+        else:
+            forecast_timestamps = pd.DatetimeIndex(pd.to_datetime(list(timestamps)))
+    else:
+        h = horizon or payload["horizon"]
+        forecast_timestamps = pd.date_range(
+            start=pd.Timestamp.now().floor("h") + pd.Timedelta(hours=1),
+            periods=h,
+            freq="h",
+        )
+
+    n = len(forecast_timestamps)
+
+    # ── Prophet ───────────────────────────────────────────────────
+    if model_name == "prophet":
+        model  = payload["model"]
+        future = pd.DataFrame({"ds": forecast_timestamps})
+        future["floor"] = 0.0
+        future["cap"]   = float(capacity_mw)
+        fc_df  = model.predict(future)
+
+        prophet_fc = fc_df["yhat"].clip(0, capacity_mw).values.copy()
+        fc_lower   = fc_df["yhat_lower"].clip(lower=0).values.copy()
+        fc_upper   = fc_df["yhat_upper"].clip(upper=capacity_mw).values.copy()
+
+        # Blend with baseline (same ratio as training)
+        baseline   = np.full(n, capacity_mw)
+        blended_fc = 0.70 * prophet_fc + 0.30 * baseline
+        method     = "blend_prophet_baseline"
+
+    # ── Capacity baseline ─────────────────────────────────────────
+    else:
+        blended_fc = np.full(n, capacity_mw, dtype=float)
+        fc_lower   = np.maximum(0,           blended_fc - 1.5 * val_rmse)
+        fc_upper   = np.minimum(capacity_mw, blended_fc + 1.5 * val_rmse)
+        method     = "capacity_baseline"
+
+    # Hard physical bounds
+    blended_fc = np.clip(blended_fc, 0, capacity_mw)
+    fc_lower   = np.maximum(0,           fc_lower)
+    fc_upper   = np.minimum(capacity_mw, fc_upper)
+
+    return pd.DataFrame({
+        "plant_id":              plant_id,
+        "timestamp":             forecast_timestamps,
+        "availability_forecast": np.round(blended_fc, 2),
+        "lower_90":              np.round(fc_lower,   2),
+        "upper_90":              np.round(fc_upper,   2),
+        "method":                method,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PART 4 — DATA PREPARATION
+# ══════════════════════════════════════════════════════════════════════
+
+def prepare_availability_input(merged_df: pd.DataFrame) -> pd.DataFrame:
     needed = ["timestamp", "plant_id", "availability_mw", "capacity_mw"]
     df = merged_df[needed].copy()
     df["timestamp"]       = pd.to_datetime(df["timestamp"])
@@ -302,7 +354,7 @@ def prepare_availability_input(
 
     parts = []
     for plant_id, plant_df in df.groupby("plant_id"):
-        capacity_mw = plant_df["capacity_mw"].median()   # stable plant property
+        capacity_mw = plant_df["capacity_mw"].median()
 
         series = (
             plant_df.set_index("timestamp")["availability_mw"]
@@ -312,12 +364,8 @@ def prepare_availability_input(
                 plant_df["timestamp"].max(), freq="h",
             ))
         )
-
-        # Forward-fill short gaps (SCADA holds last value)
         series = series.ffill(limit=3)
-        # Remaining NaNs → assume full availability
         series = series.fillna(capacity_mw)
-        # Physical bounds
         series = series.clip(lower=0, upper=capacity_mw)
 
         parts.append(pd.DataFrame({
@@ -330,98 +378,24 @@ def prepare_availability_input(
     out = pd.concat(parts, ignore_index=True)
     avg_utilisation = (out["availability_mw"] / out["capacity_mw"]).mean() * 100
     print(f"[Availability prep] {out['plant_id'].nunique()} plants | "
-          f"{len(out):,} rows | "
-          f"avg utilisation: {avg_utilisation:.1f}%")
+          f"{len(out):,} rows | avg utilisation: {avg_utilisation:.1f}%")
     return out
 
 
 # ══════════════════════════════════════════════════════════════════════
-# PART 4 — FLEET RUNNERS (parallelised)
+# PART 5 — FLEET RUNNER
 # ══════════════════════════════════════════════════════════════════════
-import joblib
-from pathlib import Path
-from datetime import datetime
-
-MODEL_DIR = Path("models/availability")
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-def _availability_worker(plant_id, plant_df, horizon):
-    warnings.filterwarnings("ignore")
-    try:
-        capacity_mw = plant_df["capacity_mw"].median()
-        series = (
-            plant_df.sort_values("timestamp")
-            .set_index("timestamp")["availability_mw"]
-            .asfreq("h")
-            .fillna(capacity_mw)      # assume available when reading missing
-            .clip(lower=0, upper=capacity_mw)
-        )
-        if len(series) < 500:
-            return {"status": "skip", "plant_id": plant_id,
-                    "error": f"only {len(series)} obs"}
-        result = forecast_availability_one_plant(
-            plant_id, series, capacity_mw, horizon
-        )
-                # ── Save model ───────────────────────────────
-        prophet_model = result.get("prophet_model", None)
-        best_model    = result.get("best_model")
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
-        model_path = MODEL_DIR / f"{plant_id}_availability_model_{ts}.joblib"
-
-        joblib.dump(
-            {
-                "prophet_model": prophet_model,   # may be None
-                "best_model": best_model,
-                "plant_id": plant_id,
-                "capacity_mw": float(capacity_mw),
-                "horizon": horizon,
-            },
-            model_path,
-            compress=3,
-        )
-        return {"status": "ok", "plant_id": plant_id,
-                "forecast_df": result["forecast_df"],
-                "best_model":  result["best_model"]}
-    except Exception as e:
-        import traceback
-        return {"status": "error", "plant_id": plant_id,
-                "forecast_df": None,
-                "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"}
-
 
 def run_availability_fleet(
     merged_df: pd.DataFrame,
     horizon: int = 72,
     n_jobs: int = -1,
 ) -> pd.DataFrame:
-    """
-    Forecast availability_mw for all plants in parallel.
-
-    Parameters
-    ----------
-    merged_df : pd.DataFrame
-        Must contain: timestamp, plant_id, availability_mw, capacity_mw
-    horizon   : int
-        Forecast hours (default 72 — matches irradiance fleet default)
-    n_jobs    : int
-        Parallel workers (-1 = all cores)
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        plant_id, timestamp, availability_forecast, lower_90, upper_90, method
-    Also saves → data/forecasts/availability_forecasts.csv
-    """
     import multiprocessing
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     avail_df = prepare_availability_input(merged_df)
-
-    groups = [
-        (pid, grp.copy())
-        for pid, grp in avail_df.groupby("plant_id")
-    ]
+    groups   = [(pid, grp.copy()) for pid, grp in avail_df.groupby("plant_id")]
     n        = len(groups)
     resolved = min(multiprocessing.cpu_count() if n_jobs == -1 else n_jobs, n)
 

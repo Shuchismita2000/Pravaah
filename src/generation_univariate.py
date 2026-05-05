@@ -24,6 +24,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import torch
 import torch.nn as nn
 
+import pickle
 from joblib import Parallel, delayed
 import os
 import traceback
@@ -924,19 +925,20 @@ def _process_one_plant(
 
         
         ts = datetime.now().strftime("%Y%m%d_%H%M")
-        model_path = MODEL_DIR / f"{plant_id}_generation_model_{ts}.joblib"
+        model_path = MODEL_DIR / f"{plant_id}_generation_model_{ts}.pkl"
 
-        joblib.dump(
-            {
+
+        payload = {
             "model": model_obj,
             "plant_id": plant_id,
             "plant_type": plant_type,
             "model_name": model_name,
-        },
-        model_path,
-        compress=3,
-    )
+        }
 
+        with open(model_path, "wb") as f:
+            pickle.dump(payload, f)
+
+        print(f"    Saved pkl → {model_path.name}")
         fc_df = result.get("forecast_df")
         if fc_df is None or len(fc_df) == 0:
             return {

@@ -209,9 +209,10 @@ def forecast_irradiance_one_plant(
 
     # ── 2. Prophet ────────────────────────────────────────────────────
     prophet_val_fc = None
+    prophet_model  = None
     if HAS_PROPHET:
         try:
-            _, prophet_val_df = _prophet_irradiance_forecast(train, horizon=val_hours)
+            prophet_model, prophet_val_df = _prophet_irradiance_forecast(train, horizon=val_hours)
             prophet_val_fc    = prophet_val_df["yhat"].values
             results["prophet"] = _evaluate(val.values, prophet_val_fc, "prophet")
         except Exception as e:
@@ -271,6 +272,7 @@ def forecast_irradiance_one_plant(
         "plant_id":    plant_id,
         "scores":      results,
         "best_model":  best,
+        "model_obj":   prophet_model if best == "prophet" else None,
         "forecast_df": forecast_df,
     }
 
@@ -328,7 +330,6 @@ def prepare_irradiance_input(
 # ══════════════════════════════════════════════════════════════════════
 # PART 4 — FLEET RUNNERS (parallelised)
 # ══════════════════════════════════════════════════════════════════════
-import joblib
 from pathlib import Path
 from datetime import datetime
 
@@ -351,31 +352,147 @@ def _irradiance_worker(plant_id, plant_df, plant_meta, horizon):
         )
 
         # ── Save model ───────────────────────────────
-        model = result.get("best_model")
-        if model is not None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
-            model_path = MODEL_DIR / f"{plant_id}_irradiance_model_{ts}.joblib"
+        import pickle
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        model_path = MODEL_DIR / f"{plant_id}_irradiance_{ts}.pkl"
 
-            joblib.dump(
-                {
-                    "model": model,
-                    "plant_id": plant_id,
-                    "plant_meta": plant_meta,
-                    "horizon": horizon,
-                    "model_name": result.get("best_model"),
-                },
-                model_path,
-                compress=3,
-            )
+        best = result["best_model"]
+        if best == "prophet":
+            payload = {
+                "model_name": "prophet",
+                "model":      result["model_obj"],   # fitted Prophet — call model.predict(future)
+                "plant_id":   plant_id,
+                "plant_meta": plant_meta,
+                "horizon":    horizon,
+            }
+        else:
+            # Physics is a pure function — no object to store.
+            # Save only the parameters needed to reproduce the forecast.
+            payload = {
+                "model_name": "physics",
+                "model":      None,
+                "plant_id":   plant_id,
+                "plant_meta": plant_meta,   # must contain latitude
+                "horizon":    horizon,
+            }
+
+        with open(model_path, "wb") as f:
+            pickle.dump(payload, f)
+
+        print(f"    Saved pkl -> {model_path.name}")
         return {"status": "ok", "plant_id": plant_id,
                 "forecast_df": result["forecast_df"],
-                "best_model": result["best_model"]}
+                "best_model": best}
     except Exception as e:
         import traceback
         return {"status": "error", "plant_id": plant_id,
                 "forecast_df": None,
                 "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"}
 
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PART 5 — PREDICT FROM SAVED PKL
+# ══════════════════════════════════════════════════════════════════════
+
+def predict_irradiance(
+    pkl_path: str,
+    timestamps,           # pd.DatetimeIndex, list of datetimes, or pd.Series of timestamps
+    horizon: int = None,  # used ONLY when timestamps is None (fallback)
+) -> pd.DataFrame:
+    """
+    Load a saved pkl and predict irradiance for a given set of timestamps.
+
+    Parameters
+    ----------
+    pkl_path   : path to .pkl saved by _irradiance_worker
+    timestamps : the exact timestamps you want predictions for.
+                 Can be:
+                   - pd.DatetimeIndex
+                   - list / array of datetime-like values
+                   - pd.Series of timestamps
+                 If None, falls back to building a date_range of  hours from now.
+    horizon    : only used when timestamps=None; falls back to value stored in pkl.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        plant_id, timestamp, irradiance_forecast, lower_90, upper_90, method
+
+    Example
+    -------
+    # You have a DatetimeIndex or list of timestamps to predict:
+    ts = pd.date_range("2026-06-01", periods=72, freq="h")
+    df = predict_irradiance("PLANT_A_irradiance_20260505_1400.pkl", timestamps=ts)
+
+    # Or from a DataFrame column:
+    df = predict_irradiance(pkl_path, timestamps=my_df["timestamp"])
+    """
+    import pickle
+
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+
+    model_name = payload["model_name"]
+    plant_id   = payload["plant_id"]
+    plant_meta = payload["plant_meta"]
+    lat        = plant_meta.get("latitude", 15.0)
+
+    # ── Resolve timestamps ────────────────────────────────────────────
+    if timestamps is not None:
+        if isinstance(timestamps, pd.Series):
+            forecast_timestamps = pd.DatetimeIndex(pd.to_datetime(timestamps.values))
+        elif isinstance(timestamps, pd.DatetimeIndex):
+            forecast_timestamps = timestamps
+        else:
+            forecast_timestamps = pd.DatetimeIndex(pd.to_datetime(list(timestamps)))
+    else:
+        # fallback: build from horizon
+        h = horizon or payload["horizon"]
+        forecast_timestamps = pd.date_range(
+            start=pd.Timestamp.now().floor("h") + pd.Timedelta(hours=1),
+            periods=h,
+            freq="h",
+        )
+
+    # ── Prophet ───────────────────────────────────────────────────────
+    if model_name == "prophet":
+        model  = payload["model"]
+        future = pd.DataFrame({"ds": forecast_timestamps})
+        future["floor"] = 0.0
+        future["cap"]   = 1300.0
+        fc_df  = model.predict(future)
+        fc     = fc_df["yhat"].clip(0, 1300).values.copy()
+        lower  = fc_df["yhat_lower"].clip(lower=0).values.copy()
+        upper  = fc_df["yhat_upper"].clip(upper=1300).values.copy()
+        # Blend: prophet for magnitude, physics for shape
+        physics = _physics_irradiance_forecast(forecast_timestamps, latitude=lat)
+        blended = 0.70 * fc + 0.30 * physics
+        method  = "blend_prophet_physics"
+
+    # ── Physics ───────────────────────────────────────────────────────
+    else:
+        blended = _physics_irradiance_forecast(forecast_timestamps, latitude=lat)
+        rmse    = payload.get("val_rmse", 80.0)   # stored during training if available
+        lower   = np.maximum(0, blended - 1.5 * rmse)
+        upper   = np.minimum(1300, blended + 1.5 * rmse)
+        method  = "physics"
+
+    # ── Hard zero for night hours ─────────────────────────────────────
+    night = (forecast_timestamps.hour < 6) | (forecast_timestamps.hour > 18)
+    blended[night] = 0.0
+    lower[night]   = 0.0
+    upper[night]   = 0.0
+
+    return pd.DataFrame({
+        "plant_id":            plant_id,
+        "timestamp":           forecast_timestamps,
+        "irradiance_forecast": np.round(blended, 2),
+        "lower_90":            np.round(lower,   2),
+        "upper_90":            np.round(upper,   2),
+        "method":              method,
+    })
 
 
 def run_irradiance_fleet(

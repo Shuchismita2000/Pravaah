@@ -45,6 +45,7 @@ from sklearn.metrics import (
     f1_score, precision_score, recall_score
 )
 from joblib import Parallel, delayed
+import pickle
 
 try:
     import lightgbm as lgb
@@ -552,13 +553,9 @@ def apply_curtailment_correction(
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 6 — FLEET RUNNER
 # ══════════════════════════════════════════════════════════════════════
-import joblib
-from pathlib import Path
 from datetime import datetime
 
 MODEL_DIR = Path("models/curtailment")
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def _process_curtailment_one_plant(
@@ -575,35 +572,29 @@ def _process_curtailment_one_plant(
         result = forecast_curtailment_one_plant(
             plant_id, plant_df, future_df, val_days
         )
-         # ── Save model ───────────────────────────────
-        clf = result.get("classifier_model")
-        reg = result.get("regressor_model")
-        fallback_mean = result.get("fallback_mean")
+        # ── Save pkl ─────────────────────────────────────────────────
+        ts         = datetime.now().strftime("%Y%m%d_%H%M")
+        model_path = MODEL_DIR / f"{plant_id}_curtailment_{ts}.pkl"
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        payload = {
+            "classifier":    result["classifier_model"],  # predict_proba → curtailment probability
+            "regressor":     result["regressor_model"],   # predict → curtailment MW (None = use fallback_mean)
+            "fallback_mean": result["fallback_mean"],     # mean MW used when regressor is None
+            "plant_id":      plant_id,
+            "plant_type":    plant_type,
+            "capacity_mw":   float(capacity_mw),
+            "features":      CURTAILMENT_FEATURES,
+        }
 
-        model_path = MODEL_DIR / f"{plant_id}_curtailment_model_{ts}.joblib"
+        with open(model_path, "wb") as f:
+            pickle.dump(payload, f)
 
-        joblib.dump(
-                {
-                    "classifier": clf,
-                    "regressor": reg,
-                    "fallback_mean": fallback_mean,
-                    "plant_id": plant_id,
-                    "plant_type": plant_type,
-                    "capacity_mw": float(capacity_mw),
-                    "val_days": val_days,
-                    "features": CURTAILMENT_FEATURES,
-                },
-                model_path,
-                compress=3,
-            )      
+        print(f"    Saved pkl → {model_path.name}")
 
-            
-        # ── Return success result ────────────────────
+        # ── Return success result ─────────────────────────────────────
         return {
-            "status": "ok",
-            "plant_id": plant_id,
+            "status":      "ok",
+            "plant_id":    plant_id,
             "forecast_df": result.get("forecast_df"),
         }
     
@@ -614,6 +605,85 @@ def _process_curtailment_one_plant(
             "forecast_df": None,
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
         }
+
+
+def predict_curtailment(
+    pkl_path: str,
+    future_features_df: pd.DataFrame,  # output of build_curtailment_future_features()
+) -> pd.DataFrame:
+    """
+    Load a saved curtailment pkl and predict for the given future feature rows.
+
+    Because curtailment uses lag features (curtailed_lag_1, curtail_rate_24h, etc.)
+    the future features MUST be built with build_curtailment_future_features() —
+    you cannot just pass raw timestamps here.
+
+    Parameters
+    ----------
+    pkl_path           : path to .pkl saved by _process_curtailment_one_plant
+    future_features_df : DataFrame with curtailment feature columns + timestamp.
+                         Build it with:
+                             future_feat = build_curtailment_future_features(
+                                 hist_feat_df, plant_id, plant_fc_df,
+                                 capacity_mw, plant_type,
+                             )
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        plant_id, timestamp, curtailment_mw_forecast,
+        curtail_probability, curtail_amount_given_event
+
+    Example
+    -------
+    future_feat = build_curtailment_future_features(
+        hist_feat_df, "PLANT_001", plant_fc_df, capacity_mw=50.0, plant_type="Solar"
+    )
+    df = predict_curtailment(
+        "models/curtailment/PLANT_001_curtailment_20260505_1400.pkl",
+        future_feat,
+    )
+    """
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+
+    clf          = payload["classifier"]
+    reg          = payload["regressor"]
+    fallback_mean= payload["fallback_mean"]
+    plant_id     = payload["plant_id"]
+    feat_cols    = payload["features"]
+
+    # ── Align feature columns ─────────────────────────────────────────
+    # Fill any missing features with 0 (same fallback as training worker)
+    available = [c for c in feat_cols if c in future_features_df.columns]
+    missing   = set(feat_cols) - set(available)
+    if missing:
+        print(f"[WARN] {plant_id}: filling {len(missing)} missing features with 0: {missing}")
+        for col in missing:
+            future_features_df[col] = 0.0
+
+    X_future = future_features_df[feat_cols].values
+
+    # ── Stage 1: probability of curtailment ───────────────────────────
+    curt_prob = clf.predict_proba(X_future)[:, 1]
+
+    # ── Stage 2: curtailment amount ───────────────────────────────────
+    if reg is not None:
+        curt_amount = np.maximum(0, reg.predict(X_future))
+    else:
+        curt_amount = np.full(len(X_future), fallback_mean if fallback_mean else 0.0)
+
+    # ── Combined forecast: E[curtailment] = P(curtail) × amount ──────
+    curt_forecast = curt_prob * curt_amount
+
+    return pd.DataFrame({
+        "plant_id":                  plant_id,
+        "timestamp":                 future_features_df["timestamp"].values,
+        "curtailment_mw_forecast":   np.round(curt_forecast, 3),
+        "curtail_probability":       np.round(curt_prob,     3),
+        "curtail_amount_given_event": np.round(curt_amount,  3),
+    })
+
 
 def run_curtailment_fleet(
     curtailment_input_df: pd.DataFrame,   # single merged dataframe — see below
