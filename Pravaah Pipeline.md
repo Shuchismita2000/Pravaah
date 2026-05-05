@@ -35,12 +35,6 @@ Forecast individually:
 - Availability
     
 - Health factor
-    
-
- Models:
-
-- SARIMAX / LightGBM / XGBoost / LSTM (depending on your notebook)
-    
 
 ---
 
