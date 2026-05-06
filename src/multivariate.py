@@ -3,56 +3,6 @@ multivariate.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Karnataka Renewable Energy Grid — Multivariate Forecasting Pipeline
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-ACTUAL COLUMN SCHEMA
-─────────────────────────────────────────────────────────────────────
-Both historical_df_solar and forecast_df_solar share the same schema:
-
-  Index(['plant_id', 'capacity_mw', 'timestamp', 'actual_generation_mw',
-         'curtailment_mw', 'availability_mw', 'temperature', 'cloud_cover',
-         'wind_speed', 'wind_direction', 'irradiance', 'health_factor',
-         'plant_type_code', 'plant_type_Hybrid', 'plant_type_Solar',
-         'plant_type_Wind', 'generation', 'capacity_factor',
-         'generation_shortfall_mw', 'net_availability_mw',
-         'health_adjusted_capacity_mw', 'is_degraded', 'is_offline',
-         'generation_norm', 'hour', 'day_of_year', 'month', 'day_of_week',
-         'is_weekend', 'hour_sin', 'hour_cos', 'doy_sin', 'doy_cos',
-         'month_sin', 'month_cos', 'clear_sky_irradiance', 'irradiance_adjusted',
-         'irradiance_ratio', 'temp_effect', 'expected_generation',
-         'performance_ratio', 'pr_rolling_7', 'pr_rolling_30',
-         'days_since_cleaning', 'soiling_loss', 'adjusted_generation_signal',
-         'is_daylight', 'gen_lag_1', 'gen_lag_24', 'gen_lag_168',
-         'gen_rolling_mean_6', 'gen_rolling_std_6', 'gen_rolling_mean_24',
-         'gen_rolling_mean_168', 'cuf', 'ramp_rate', 'ramp_abs',
-         'gen_momentum_3', 'gen_momentum_6', 'daily_generation', 'load_factor',
-         'is_peak', 'gen_variability_24', 'gen_variability_168', 'is_zero_gen',
-         'zero_streak', 'gen_residual_24', 'gen_normalized'])
-
-TARGET:   generation  (MW)
-HORIZON:  72 hours    (t+1 .. t+72)
-
-KEY DESIGN DECISIONS
-─────────────────────────────────────────────────────────────────────
-• forecast_df_solar.generation  = univariate forecast_mw proxy
-  (filled upstream by run_univariate_fleet).
-  forecast_df_solar does NOT have forecast_mw / lower_90 / upper_90.
-• historical_df_solar.generation = actual measured generation.
-• Both DataFrames are concatenated per plant with an is_forecast flag.
-• Confidence intervals are produced HERE from walk-forward RMSE —
-  they do not come from the input DataFrames.
-
-SECTIONS
-─────────────────────────────────────────────────────────────────────
-  1.  Imports & constants
-  2.  Data merger
-  3.  STL decomposition
-  4.  Feature matrix builder
-  5.  Models: LightGBM, XGBoost, Ridge, SVR
-  6.  Walk-forward validator
-  7.  Model selector (per plant)
-  8.  Monte Carlo scenario simulator
-  9.  Fleet runner (parallelised)
-  10. Public API & usage examples
 """
 
 # ══════════════════════════════════════════════════════════════════════
@@ -60,9 +10,11 @@ SECTIONS
 # ══════════════════════════════════════════════════════════════════════
 
 import warnings
+import pickle
 import traceback
 import multiprocessing
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -90,56 +42,48 @@ except ImportError:
     HAS_XGB = False
     print("[WARN] xgboost not installed — pip install xgboost")
 
-TARGET   = "generation"   # internal name used throughout this file
-HORIZON  = 72             # hours ahead
-VAL_DAYS = 14             # default walk-forward validation window
+TARGET   = "generation"
+HORIZON  = 72
+VAL_DAYS = 14
 
-# Accepted names for the target column (either is fine on input)
 _TARGET_ALIASES = {"generation", "actual_generation_mw"}
+REQUIRED_COLS   = {"plant_id", "timestamp", "generation"}
 
-# Minimum required columns — both dfs share the same schema
-REQUIRED_COLS = {"plant_id", "timestamp", "generation"}
+BASE_MODEL_DIR = Path("models/multivariate")
 
-# ── Exogenous features ─────────────────────────────────────────────
-# Present in forecast_df_solar — known or safely estimated for t+1..t+72
 EXOGENOUS_FEATURES = [
-    # Weather
     "irradiance_adjusted", "irradiance_ratio", "clear_sky_irradiance",
     "temp_effect", "cloud_cover", "wind_speed", "wind_direction", "temperature",
-    # Calendar (always exact in future)
     "hour", "day_of_year", "month", "day_of_week", "is_weekend",
     "hour_sin", "hour_cos", "doy_sin", "doy_cos", "month_sin", "month_cos",
-    # Plant type — static flags
     "plant_type_code", "plant_type_Hybrid", "plant_type_Solar", "plant_type_Wind",
-    # Plant health & capacity
     "capacity_mw", "is_degraded", "is_offline",
     "health_factor", "health_adjusted_capacity_mw",
-    # Operational state
     "curtailment_mw", "availability_mw", "net_availability_mw",
-    # Maintenance
     "days_since_cleaning", "soiling_loss",
-    # Computed flags
     "is_daylight",
 ]
 
-# ── Endogenous features ────────────────────────────────────────────
-# Built from historical generation; forecast_df has them pre-computed
-# using the univariate proxy as the generation source.
-ENDOGENOUS_FEATURES = [
+# SAFE: only lag-based (available at inference)
+SAFE_ENDOGENOUS_FEATURES = [
     "gen_lag_1", "gen_lag_24", "gen_lag_168",
     "gen_rolling_mean_6", "gen_rolling_std_6",
     "gen_rolling_mean_24", "gen_rolling_mean_168",
-    "pr_rolling_7", "pr_rolling_30",
-    "cuf", "load_factor", "capacity_factor",
-    "generation_norm", "generation_shortfall_mw", "adjusted_generation_signal",
-    "expected_generation", "performance_ratio",
-    "ramp_rate", "ramp_abs", "gen_momentum_3", "gen_momentum_6",
-    "gen_variability_24", "gen_variability_168",
+    "ramp_rate", "ramp_abs",
+    "gen_momentum_3", "gen_momentum_6",
     "gen_residual_24", "gen_normalized",
-    "is_zero_gen", "zero_streak",
-    "daily_generation", "is_peak",
 ]
 
+# REMOVE these from training completely (leakage)
+LEAKY_FEATURES = [
+    "generation_norm", "generation_shortfall_mw",
+    "adjusted_generation_signal", "expected_generation",
+    "performance_ratio", "cuf", "load_factor",
+    "capacity_factor", "daily_generation", "is_peak",
+    "gen_variability_24", "gen_variability_168",
+    "pr_rolling_7", "pr_rolling_30",
+    "is_zero_gen", "zero_streak",
+]
 
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 2 — DATA MERGER
@@ -149,30 +93,6 @@ def merge_for_multivariate(
     historical_df: pd.DataFrame,
     forecast_df:   pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Stack historical_df and forecast_df into one extended DataFrame.
-
-    Both DataFrames have the same column schema.
-      historical_df.generation = actual measured generation
-      forecast_df.generation   = univariate proxy (filled upstream)
-
-    Steps
-    -----
-    1. Validate required columns on both inputs.
-    2. Tag: is_forecast=False (history) / True (future).
-    3. Concatenate per plant, sorted by timestamp.
-    4. Recompute boundary lags that cross history->forecast edge.
-    5. Return combined DataFrame.
-
-    Parameters
-    ----------
-    historical_df : historical_df_solar — actual generation history.
-    forecast_df   : forecast_df_solar   — same schema, generation=proxy.
-
-    Returns
-    -------
-    pd.DataFrame with all original columns + is_forecast flag.
-    """
     historical_df = _rename_target(historical_df)
     _validate_cols(historical_df, "historical_df")
     _validate_cols(forecast_df,   "forecast_df")
@@ -218,35 +138,23 @@ def merge_for_multivariate(
 
 
 def _rename_target(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalise target column name to 'generation'.
-    Accepts 'actual_generation_mw' or 'generation' on input.
-    forecast_df will never have the target — that is fine.
-    """
     if "actual_generation_mw" in df.columns and "generation" not in df.columns:
         df = df.rename(columns={"actual_generation_mw": "generation"})
     return df
 
 
 def _validate_cols(df: pd.DataFrame, name: str) -> None:
-    # forecast_df has no target — only require plant_id + timestamp for it
-    has_target = "generation" in df.columns or "actual_generation_mw" in df.columns
+    has_target  = "generation" in df.columns or "actual_generation_mw" in df.columns
     cols_needed = REQUIRED_COLS if has_target else {"plant_id", "timestamp"}
-    missing = cols_needed - set(df.columns)
+    missing     = cols_needed - set(df.columns)
     if missing:
         raise ValueError(
             f"[Validate] {name} missing required columns: {missing}\n"
-            f"  historical_df needs: {sorted(REQUIRED_COLS)}\n"
-            f"  forecast_df needs: ['plant_id', 'timestamp'] (no target column)\n"
             f"  Got: {sorted(df.columns.tolist())}"
         )
 
 
 def _recompute_boundary_lags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fill NaN lag/rolling values that arise at the history->forecast
-    boundary.  Only fills NaN slots — clean historical values kept.
-    """
     df = df.sort_values("timestamp").reset_index(drop=True)
     g  = df["generation"]
 
@@ -283,32 +191,6 @@ def decompose_series(
     period:        int = 24,
     weekly_period: int = 168,
 ) -> dict:
-    """
-    STL (Seasonal-Trend decomposition using LOESS) on generation series.
-
-    Runs two decompositions:
-      - Daily  (period=24)  — intraday solar curve
-      - Weekly (period=168) — weekly dispatch pattern
-
-    Why STL over classical decomposition:
-      - Robust to the many zeros in solar (night hours)
-      - LOESS handles outliers gracefully
-      - residual_std directly measures unexplained variance:
-          high → hard to forecast, may need more features
-
-    Parameters
-    ----------
-    series   : pd.Series, DatetimeIndex, hourly frequency.
-               e.g. df.set_index("timestamp")["generation"].asfreq("h")
-    plant_id : label for print output only.
-
-    Returns
-    -------
-    dict: plant_id, trend, seasonal, residual (from daily STL),
-          seasonal_strength, weekly_strength, trend_strength,
-          residual_std, residual_mean, dominant_period,
-          forecast_difficulty, stl_daily, stl_weekly
-    """
     series = series.dropna()
     if len(series) < period * 2:
         raise ValueError(
@@ -316,7 +198,7 @@ def decompose_series(
         )
 
     def _fit(p: int):
-        sw = max(7, (p // 3) | 1)   # odd, >= 7
+        sw = max(7, (p // 3) | 1)
         return STL(series, period=p, seasonal=sw, trend=None, robust=True).fit()
 
     stl_d    = _fit(period)
@@ -366,17 +248,6 @@ def decompose_fleet(
     historical_df: pd.DataFrame,
     output_csv:    str = "data/multivariate/stl_fleet_summary.csv",
 ) -> pd.DataFrame:
-    """
-    Run STL for all plants; return fleet-wide summary DataFrame.
-
-    Call BEFORE training to understand plant difficulty distribution.
-
-    Returns
-    -------
-    pd.DataFrame (sorted by residual_std descending):
-        plant_id, seasonal_strength, weekly_strength, trend_strength,
-        residual_std, dominant_period, forecast_difficulty
-    """
     records = []
     for pid, pdf in historical_df.groupby("plant_id"):
         series = (
@@ -426,19 +297,8 @@ def build_feature_matrix(
     plant_id:     str,
     feature_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """
-    Split extended DataFrame into train (history) and future (forecast).
-
-    feature_cols defaults to EXOGENOUS_FEATURES + ENDOGENOUS_FEATURES,
-    filtered to columns that actually exist.
-
-    Training rows  : drop rows where any feature is NaN.
-    Forecast rows  : ffill → bfill → fillna(0)  (must keep all HORIZON rows).
-
-    Returns (train_df, future_df, resolved_feature_cols)
-    """
     if feature_cols is None:
-        all_feats    = EXOGENOUS_FEATURES + ENDOGENOUS_FEATURES
+        all_feats = EXOGENOUS_FEATURES + SAFE_ENDOGENOUS_FEATURES
         feature_cols = [c for c in all_feats if c in extended_df.columns]
 
     pdf = (
@@ -490,7 +350,6 @@ def fit_lgbm_multivariate(
     X_val:   np.ndarray, y_val:   np.ndarray,
     feature_names: list[str],
 ) -> tuple[object, dict]:
-    """LightGBM with early stopping. Prints top-5 feature importances."""
     if not HAS_LGBM:
         raise ImportError("pip install lightgbm")
     model = lgb.LGBMRegressor(
@@ -518,7 +377,6 @@ def fit_xgb_multivariate(
     X_train: np.ndarray, y_train: np.ndarray,
     X_val:   np.ndarray, y_val:   np.ndarray,
 ) -> tuple[object, dict]:
-    """XGBoost with early stopping. Stronger regularisation than LGBM."""
     if not HAS_XGB:
         raise ImportError("pip install xgboost")
     model = xgb.XGBRegressor(
@@ -536,7 +394,6 @@ def fit_ridge_multivariate(
     X_train: np.ndarray, y_train: np.ndarray,
     X_val:   np.ndarray, y_val:   np.ndarray,
 ) -> tuple[object, dict]:
-    """Ridge regression + StandardScaler. Fast; wins on near-linear plants."""
     pipe = Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=1.0))])
     pipe.fit(X_train, y_train)
     return pipe, _evaluate(y_val, pipe.predict(X_val), "ridge")
@@ -546,7 +403,6 @@ def fit_svr_multivariate(
     X_train: np.ndarray, y_train: np.ndarray,
     X_val:   np.ndarray, y_val:   np.ndarray,
 ) -> tuple[object, dict]:
-    """SVR (RBF). Captures non-linear curves. Capped at 8k rows (O(n²))."""
     n_cap = min(len(X_train), 8_000)
     if n_cap < len(X_train):
         print(f"    SVR: sampling {n_cap}/{len(X_train)} rows")
@@ -570,19 +426,6 @@ def walk_forward_validate(
     val_days:     int = VAL_DAYS,
     n_splits:     int = 3,
 ) -> dict[str, list[dict]]:
-    """
-    Walk-forward (expanding-window) cross-validation.
-
-    Avoids data leakage of k-fold by always training on the past
-    and evaluating on the next unseen window.
-
-    Fold layout (val_size = val_days * 24 hours):
-      Fold 1: train [0 .. N-3V],  val [N-3V .. N-2V]
-      Fold 2: train [0 .. N-2V],  val [N-2V .. N-V ]
-      Fold 3: train [0 .. N-V ],  val [N-V  .. N   ]
-
-    Returns {model_name: [metrics_fold_1, ...]}
-    """
     df        = train_df.sort_values("timestamp").reset_index(drop=True)
     val_size  = val_days * 24
     n         = len(df)
@@ -640,34 +483,6 @@ def select_best_multivariate_model(
     val_days:     int = VAL_DAYS,
     n_splits:     int = 3,
 ) -> dict:
-    """
-    End-to-end pipeline for a single plant:
-
-      1. Build feature matrix (train / future split)
-      2. STL decomposition (diagnostic)
-      3. Walk-forward CV — LightGBM, XGBoost, Ridge, SVR
-      4. Select best model by average MAE
-      5. Refit best model on all training data
-      6. Predict generation for t+1..t+72
-      7. Build 90% confidence interval from validation RMSE
-
-    Parameters
-    ----------
-    extended_df  : Output of merge_for_multivariate().
-    plant_id     : Single plant to process.
-    feature_cols : Custom feature list (optional).
-    val_days     : Days per fold (default 14).
-    n_splits     : Walk-forward folds (default 3).
-
-    Returns
-    -------
-    dict:
-      plant_id, best_model, feature_cols,
-      decomposition, validation_scores, avg_scores,
-      final_model,
-      forecast_df  → columns: plant_id, timestamp,
-                               forecast_mw, lower_90, upper_90, model
-    """
     print(f"\n{'═'*60}")
     print(f"  MULTIVARIATE: {plant_id}")
     print(f"{'═'*60}")
@@ -678,12 +493,8 @@ def select_best_multivariate_model(
     if len(train_df) < 500:
         raise ValueError(f"Too few training rows: {len(train_df)} (need ≥500)")
     if len(future_df) == 0:
-        raise ValueError(
-            f"No forecast rows for {plant_id}. "
-            "Check forecast_df_solar has rows for this plant."
-        )
+        raise ValueError(f"No forecast rows for {plant_id}.")
 
-    # STL decomposition (diagnostic only — does not affect model)
     series = (
         train_df.sort_values("timestamp")
         .set_index("timestamp")[TARGET]
@@ -695,7 +506,6 @@ def select_best_multivariate_model(
         print(f"  [WARN] STL failed: {e}")
         decomp = None
 
-    # Walk-forward cross-validation
     print(f"\n  Walk-forward CV ({n_splits} folds × {val_days} days):")
     fold_scores = walk_forward_validate(train_df, feat_cols, val_days, n_splits)
     if not fold_scores:
@@ -717,7 +527,6 @@ def select_best_multivariate_model(
         print(f"    {m:12s}: MAE={sc['MAE']:.3f}  "
               f"RMSE={sc['RMSE']:.3f}  MAPE={sc['MAPE']:.1f}%{flag}")
 
-    # Refit on all training data
     print(f"\n  Refitting {best_name} on {len(train_df):,} rows...")
     X_all, y_all = train_df[feat_cols].values, train_df[TARGET].values
     split        = max(len(X_all) - val_days * 24, int(len(X_all) * 0.85))
@@ -732,11 +541,10 @@ def select_best_multivariate_model(
     }
     final_model, _ = fitters[best_name]()
 
-    # Predict t+1..t+72
     fc_mw    = np.maximum(0.0, final_model.predict(future_df[feat_cols].values))
     val_rmse = avg_scores[best_name]["RMSE"]
-    lower_90 = np.maximum(0.0, fc_mw - 1.645 * val_rmse)
-    upper_90 = fc_mw + 1.645 * val_rmse
+    lower_90 = np.maximum(0.0, fc_mw - 1.645 * val_rmse).copy()
+    upper_90 = (fc_mw + 1.645 * val_rmse).copy()
 
     forecast_out = pd.DataFrame({
         "plant_id":    plant_id,
@@ -757,7 +565,9 @@ def select_best_multivariate_model(
         "decomposition":     decomp,
         "validation_scores": fold_scores,
         "avg_scores":        avg_scores,
+        "val_rmse":          val_rmse,
         "final_model":       final_model,
+        "future_df":         future_df,    # kept so predict_multivariate can re-use feature cols
         "forecast_df":       forecast_out,
     }
 
@@ -773,41 +583,6 @@ def simulate_scenarios(
     n_simulations: int  = 1000,
     seed:          int  = 42,
 ) -> pd.DataFrame:
-    """
-    Monte Carlo simulation producing a probability fan around the
-    72-hour point forecast.
-
-    Named scenarios extracted from the fan:
-      scenario_worst = P10  — bad weather / high degradation
-      scenario_base  = P50  — median expected outcome
-      scenario_best  = P90  — favourable conditions
-
-    Uncertainty sources (combined in quadrature):
-      1. Model error    : σ from CI width (= val RMSE × 1.645)
-      2. Weather error  : 8% of point forecast
-      3. Residual noise : STL residual_std (unexplained variance)
-                          Falls back to 10% of mean if no decomp.
-
-    Autocorrelation ρ=0.70 (AR-1) — cloud ramps are persistent.
-    Soiling bias: 1.5% mean loss applied to all paths.
-
-    Parameters
-    ----------
-    forecast_df   : Output of select_best_multivariate_model().
-                    Required: plant_id, timestamp,
-                              forecast_mw, lower_90, upper_90.
-    decomp        : From decompose_series(). Pass None → 10% fallback.
-    capacity_mw   : Physical cap. If None → 2× max forecast.
-    n_simulations : Monte Carlo paths (default 1000).
-    seed          : Reproducibility seed.
-
-    Returns
-    -------
-    pd.DataFrame: plant_id, timestamp, forecast_mw,
-                  p10, p25, p50, p75, p90,
-                  scenario_worst, scenario_base, scenario_best,
-                  sigma_total
-    """
     rng     = np.random.RandomState(seed)
     n_steps = len(forecast_df)
     fc      = forecast_df["forecast_mw"].values.astype(float)
@@ -862,11 +637,6 @@ def simulate_scenarios(
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 9 — FLEET RUNNER
 # ══════════════════════════════════════════════════════════════════════
-import joblib
-from pathlib import Path
-from datetime import datetime
-
-BASE_MODEL_DIR = Path("models/multivariate")
 
 def _process_one_plant(
     plant_id, plant_df, feature_cols, val_days, n_splits, n_simulations
@@ -879,59 +649,65 @@ def _process_one_plant(
             val_days=val_days, n_splits=n_splits
         )
 
-        # ── Extract plant_type ───────────────────────
+        # ── Extract plant metadata ─────────────────────────────────────
         plant_type = "unknown"
         if "plant_type" in plant_df.columns:
             plant_type = str(
                 plant_df["plant_type"].dropna().iloc[0]
             ).strip().lower().replace(" ", "_")
 
-        # ── Save model ──────────────────────────────
-        model = result.get("final_model")
-        if model is not None:
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
+        cap_mw = None
+        if "capacity_mw" in plant_df.columns:
+            cap_mw = float(plant_df["capacity_mw"].dropna().iloc[0])
 
-            model_dir = BASE_MODEL_DIR / plant_type
-            model_dir.mkdir(parents=True, exist_ok=True)
+        # ── Save pkl (versioned + latest pointer) ──────────────────────
+        ts        = datetime.now().strftime("%Y%m%d_%H%M")
+        model_dir = BASE_MODEL_DIR / plant_type
+        model_dir.mkdir(parents=True, exist_ok=True)
 
-            versioned_path = model_dir / f"{plant_id}_model_{ts}.joblib"
-            latest_path    = model_dir / f"{plant_id}_latest.joblib"
+        payload = {
+            "model_name":   result["best_model"],
+            "model":        result["final_model"],  # call model.predict(X_future)
+            "plant_id":     plant_id,
+            "plant_type":   plant_type,
+            "capacity_mw":  cap_mw,
+            "feature_cols": result["feature_cols"],
+            "val_rmse":     result["val_rmse"],
+        }
 
-            payload = {
-                "model": model,
-                "plant_id": plant_id,
-                "plant_type": plant_type,
-                "feature_cols": feature_cols,
-                "model_name": result.get("best_model"),
-            }
+        versioned_path = model_dir / f"{plant_id}_{ts}.pkl"
+        latest_path    = model_dir / f"{plant_id}_latest.pkl"
 
-            joblib.dump(payload, versioned_path, compress=3)
-            joblib.dump(payload, latest_path, compress=3)  # 👈 latest pointer
+        with open(versioned_path, "wb") as f:
+            pickle.dump(payload, f)
+        with open(latest_path, "wb") as f:
+            pickle.dump(payload, f)
 
-        # ── Simulations ─────────────────────────────
+        print(f"    Saved pkl → {versioned_path.name}")
+
+        # ── Simulations ────────────────────────────────────────────────
         sim_df = simulate_scenarios(
             result["forecast_df"],
             result["decomposition"],
-            capacity_mw=result.get("capacity_mw"),
+            capacity_mw=cap_mw,
             n_simulations=n_simulations,
         )
 
         return {
-            "status": "ok",
-            "plant_id": plant_id,
-            "forecast_df": result["forecast_df"],
+            "status":        "ok",
+            "plant_id":      plant_id,
+            "forecast_df":   result["forecast_df"],
             "simulation_df": sim_df,
-            "best_model": result.get("best_model"),
-            "avg_scores": result.get("avg_scores"),
-            "decomp_summary": result.get("decomp_summary"),
+            "best_model":    result["best_model"],
+            "avg_scores":    result["avg_scores"],
+            "decomp_summary": None,
         }
 
     except Exception as e:
-        import traceback
         return {
-            "status": "error",
+            "status":   "error",
             "plant_id": plant_id,
-            "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+            "error":    f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
         }
 
 
@@ -945,49 +721,6 @@ def run_multivariate_fleet(
     n_jobs:        int  = -1,
     output_dir:    str  = "data/multivariate",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Full multivariate forecasting pipeline for all plants.
-
-    Parameters
-    ----------
-    historical_df : historical_df_solar
-                    Same schema shown at the top of this file.
-                    generation = actual measured generation.
-
-    forecast_df   : forecast_df_solar
-                    Same schema as historical_df_solar.
-                    generation = univariate proxy (filled upstream).
-                    *** Does NOT need forecast_mw / lower_90 / upper_90 ***
-                    Those columns are produced by this module, not consumed.
-
-    feature_cols  : Custom feature list (optional).
-                    Default: EXOGENOUS_FEATURES + ENDOGENOUS_FEATURES
-                             filtered to existing columns.
-
-    val_days      : Days per walk-forward fold (default 14).
-    n_splits      : Walk-forward folds (default 3).
-    n_simulations : Monte Carlo paths per plant (default 1000).
-    n_jobs        : Parallel workers (-1 = all cores).
-    output_dir    : Where to write output CSVs.
-
-    Returns
-    -------
-    (all_forecasts_df, all_simulations_df)
-
-    all_forecasts_df columns:
-        plant_id, timestamp, forecast_mw, lower_90, upper_90, model
-
-    all_simulations_df columns:
-        plant_id, timestamp, forecast_mw,
-        p10, p25, p50, p75, p90,
-        scenario_worst, scenario_base, scenario_best, sigma_total
-
-    Saved files:
-        {output_dir}/multivariate_forecasts.csv
-        {output_dir}/scenario_simulations.csv
-        {output_dir}/model_selection_log.csv
-        {output_dir}/failed_plants.csv  (only if failures)
-    """
     OUT = Path(output_dir)
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -998,11 +731,11 @@ def run_multivariate_fleet(
     print("\nMerging DataFrames...")
     extended = merge_for_multivariate(historical_df, forecast_df)
 
-    plant_ids     = sorted(extended["plant_id"].unique().tolist())
-    n_plants      = len(plant_ids)
-    max_cores     = multiprocessing.cpu_count()
-    rj            = max_cores if n_jobs == -1 else min(n_jobs, max_cores)
-    rj            = min(rj, n_plants)
+    plant_ids = sorted(extended["plant_id"].unique().tolist())
+    n_plants  = len(plant_ids)
+    max_cores = multiprocessing.cpu_count()
+    rj        = max_cores if n_jobs == -1 else min(n_jobs, max_cores)
+    rj        = min(rj, n_plants)
 
     print(f"\n{'═'*60}")
     print(f"  MULTIVARIATE FLEET RUN")
@@ -1037,8 +770,6 @@ def run_multivariate_fleet(
             for m, sc in (res["avg_scores"] or {}).items():
                 row[f"{m}_MAE"]  = sc["MAE"]
                 row[f"{m}_MAPE"] = sc["MAPE"]
-            if res["decomp_summary"]:
-                row.update(res["decomp_summary"])
             log_rows.append(row)
             mae = (res["avg_scores"] or {}).get(res["best_model"], {}).get("MAE", "?")
             print(f"  ✓ {pid}  model={res['best_model']}  MAE={mae}")
@@ -1053,10 +784,6 @@ def run_multivariate_fleet(
         print("\n  Model selection:")
         for m, cnt in log_df["best_model"].value_counts().items():
             print(f"    {m:12s}: {cnt} plants ({cnt/len(log_df):.0%})")
-        if "forecast_difficulty" in log_df.columns:
-            print("\n  Forecast difficulty:")
-            for lvl, cnt in log_df["forecast_difficulty"].value_counts().items():
-                print(f"    {lvl:8s}: {cnt} plants")
     print(f"{'═'*60}\n")
 
     log_df.to_csv(OUT / "model_selection_log.csv", index=False)
@@ -1076,11 +803,100 @@ def run_multivariate_fleet(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SECTION 10 — PUBLIC API
+# SECTION 10 — PREDICT FROM SAVED PKL
 # ══════════════════════════════════════════════════════════════════════
-import joblib
-from pathlib import Path
-from datetime import datetime
+
+def predict_multivariate(
+    pkl_path:       str,
+    future_features_df: pd.DataFrame,  # must have same feature_cols as training
+) -> pd.DataFrame:
+    """
+    Load a saved multivariate pkl and predict for the given feature rows.
+
+    Unlike irradiance/health/availability, multivariate models are
+    feature-rich (60+ columns). You cannot pass raw timestamps — you
+    must supply a future feature DataFrame with the same columns that
+    were used during training (stored in the pkl as feature_cols).
+
+    Build future_features_df the same way forecast_df_solar is built
+    upstream (exogenous weather forecasts + endogenous lag proxies).
+
+    Parameters
+    ----------
+    pkl_path           : path to .pkl saved by _process_one_plant
+                         or run_single_plant.
+    future_features_df : DataFrame with at minimum the columns in
+                         payload["feature_cols"] + "timestamp".
+                         Missing feature columns are filled with 0
+                         (with a warning).
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        plant_id, timestamp, forecast_mw, lower_90, upper_90, model
+
+    Example
+    -------
+    # Latest model pointer:
+    df = predict_multivariate(
+        "models/multivariate/solar/KA_SOLAR_001_latest.pkl",
+        future_features_df,
+    )
+
+    # Specific versioned model:
+    df = predict_multivariate(
+        "models/multivariate/solar/KA_SOLAR_001_20260505_1400.pkl",
+        future_features_df,
+    )
+    """
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+
+    model       = payload["model"]
+    model_name  = payload["model"]
+    plant_id    = payload["plant_id"]
+    feat_cols   = payload["feature_cols"]
+    val_rmse    = payload["val_rmse"]
+    capacity_mw = payload.get("capacity_mw")
+
+    # ── Align feature columns ─────────────────────────────────────────
+    missing = set(feat_cols) - set(future_features_df.columns)
+
+    if missing:
+        raise ValueError(
+            f"[ERROR] {plant_id}: Missing required features for inference:\n"
+            f"{missing}\n\n"
+            "You must supply all training features during prediction.\n"
+            "Lag features must be precomputed using historical data."
+        )
+
+    X_future = future_features_df[feat_cols].ffill().bfill().fillna(0).values
+
+    # ── Predict ───────────────────────────────────────────────────────
+    fc_mw = np.maximum(0.0, model.predict(X_future))
+
+    # Cap at capacity if available
+    if capacity_mw:
+        fc_mw = np.minimum(fc_mw, float(capacity_mw))
+
+    lower_90 = np.maximum(0.0, fc_mw - 1.645 * val_rmse).copy()
+    upper_90 = (fc_mw + 1.645 * val_rmse).copy()
+    if capacity_mw:
+        upper_90 = np.minimum(upper_90, float(capacity_mw))
+
+    return pd.DataFrame({
+        "plant_id":    plant_id,
+        "timestamp":   future_features_df["timestamp"].values,
+        "forecast_mw": np.round(fc_mw,    3),
+        "lower_90":    np.round(lower_90, 3),
+        "upper_90":    np.round(upper_90, 3),
+        "model":       model_name,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SECTION 11 — PUBLIC API
+# ══════════════════════════════════════════════════════════════════════
 
 def run_single_plant(
     historical_df: pd.DataFrame,
@@ -1093,30 +909,7 @@ def run_single_plant(
     """
     Run the full pipeline for ONE plant. Useful for debugging.
 
-    Parameters
-    ----------
-    historical_df : historical_df_solar
-    forecast_df   : forecast_df_solar (same schema, generation=proxy)
-    plant_id      : e.g. "KA_SOLAR_001"
-    n_simulations : Monte Carlo paths
-    feature_cols  : Optional custom feature list
-
-    Returns
-    -------
-    (forecast_df_out, simulation_df)
-
-    forecast_df_out: plant_id, timestamp, forecast_mw, lower_90, upper_90, model
-    simulation_df  : plant_id, timestamp, forecast_mw,
-                     p10, p25, p50, p75, p90,
-                     scenario_worst, scenario_base, scenario_best, sigma_total
-
-    Example
-    -------
-    >>> fc, sim = run_single_plant(
-    ...     historical_df_solar, forecast_df_solar, "KA_SOLAR_001"
-    ... )
-    >>> print(fc[["timestamp", "forecast_mw", "lower_90", "upper_90"]])
-    >>> print(sim[["timestamp", "p10", "p50", "p90"]].head(24))
+    Returns (forecast_df_out, simulation_df)
     """
     extended = merge_for_multivariate(historical_df, forecast_df)
     result   = select_best_multivariate_model(extended, plant_id, feature_cols)
@@ -1126,29 +919,30 @@ def run_single_plant(
     if mask.any() and "capacity_mw" in historical_df.columns:
         cap_mw = float(historical_df.loc[mask, "capacity_mw"].iloc[0])
 
-     # ── Save model ───────────────────────────────
-    model = result.get("final_model", None)
-    if model is not None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
+    # ── Save pkl ──────────────────────────────────────────────────────
+    ts        = datetime.now().strftime("%Y%m%d_%H%M")
+    model_dir = BASE_MODEL_DIR / plant_type
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-        model_dir = Path("models/multivariate") / plant_type
-        model_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_name":   result["best_model"],
+        "model":        result["final_model"],  # call model.predict(X_future)
+        "plant_id":     plant_id,
+        "plant_type":   plant_type,
+        "capacity_mw":  cap_mw,
+        "feature_cols": result["feature_cols"],
+        "val_rmse":     result["val_rmse"],
+    }
 
-        model_path = model_dir / f"{plant_id}_model_{ts}.joblib"
+    versioned_path = model_dir / f"{plant_id}_{ts}.pkl"
+    latest_path    = model_dir / f"{plant_id}_latest.pkl"
 
-        joblib.dump(
-            {
-                "model": model,
-                "plant_id": plant_id,
-                "plant_type": plant_type,
-                "capacity_mw": cap_mw,
-                "feature_cols": feature_cols,
-                "model_name": result.get("model_name"),
-            },
-            model_path,
-            compress=3,
-        )
+    with open(versioned_path, "wb") as f:
+        pickle.dump(payload, f)
+    with open(latest_path, "wb") as f:
+        pickle.dump(payload, f)
 
+    print(f"    Saved pkl → {versioned_path.name}")
 
     sim_df = simulate_scenarios(
         result["forecast_df"], result["decomposition"],
@@ -1164,21 +958,10 @@ def run_decomposition_only(
     """
     Run STL decomposition fleet-wide WITHOUT training any models.
 
-    Use before training to:
-      - Identify easy / medium / hard plants
-      - Spot high residual-variance plants (may need extra features)
-      - See whether daily or weekly seasonality dominates
-
     Returns
     -------
     pd.DataFrame: plant_id, seasonal_strength, weekly_strength,
                   trend_strength, residual_std,
                   dominant_period, forecast_difficulty
-
-    Example
-    -------
-    >>> stl = run_decomposition_only(historical_df_solar)
-    >>> hard = stl[stl["forecast_difficulty"] == "hard"]
-    >>> print(hard[["plant_id", "residual_std"]].to_string())
     """
     return decompose_fleet(historical_df, output_csv=output_csv)

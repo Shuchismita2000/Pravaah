@@ -791,53 +791,55 @@ def select_best_univariate_model(
         start=series.index[-1] + pd.Timedelta(hours=1),
         periods=horizon, freq="h",
     )
-    fc_mw    = np.zeros(horizon)
-    fc_lower = np.zeros(horizon)
-    fc_upper = np.zeros(horizon)
+    fc_mw       = np.zeros(horizon)
+    fc_lower    = np.zeros(horizon)
+    fc_upper    = np.zeros(horizon)
+    fit_obj     = None   # actual model object — set per branch
+    lstm_scaler = None   # only set for lstm branch
 
     if best_name == "ets":
         fit_obj, fc_mw = fit_ets(series, horizon=horizon)
-        fc_lower = np.maximum(0, fc_mw * 0.85)
-        fc_upper = fc_mw * 1.15
+        fc_lower = np.maximum(0, fc_mw * 0.85).copy()
+        fc_upper = (fc_mw * 1.15).copy()
 
     elif best_name == "theta":
         fit_obj, fc_mw = fit_theta(series, horizon=horizon)
-        fc_lower = np.maximum(0, fc_mw * 0.85)
-        fc_upper = fc_mw * 1.15
+        fc_lower = np.maximum(0, fc_mw * 0.85).copy()
+        fc_upper = (fc_mw * 1.15).copy()
 
     elif best_name == "sarima":
         fit_obj, fc_mw = fit_sarima(series, horizon=horizon)
         try:
             ci       = fit_obj.get_forecast(steps=horizon).conf_int(alpha=0.10)
-            fc_lower = np.maximum(0, ci.iloc[:, 0].values)
-            fc_upper = ci.iloc[:, 1].values
+            fc_lower = np.maximum(0, ci.iloc[:, 0].values).copy()
+            fc_upper = ci.iloc[:, 1].values.copy()
         except Exception:
-            fc_lower = np.maximum(0, fc_mw * 0.85)
-            fc_upper = fc_mw * 1.15
+            fc_lower = np.maximum(0, fc_mw * 0.85).copy()
+            fc_upper = (fc_mw * 1.15).copy()
 
     elif best_name == "prophet":
-        _, fc_df_full = fit_prophet(series, horizon=horizon)
-        fc_mw    = fc_df_full["yhat"].values
-        fc_lower = fc_df_full["yhat_lower"].clip(lower=0).values
-        fc_upper = fc_df_full["yhat_upper"].values
+        fit_obj, fc_df_full = fit_prophet(series, horizon=horizon)
+        fc_mw    = fc_df_full["yhat"].values.copy()
+        fc_lower = fc_df_full["yhat_lower"].clip(lower=0).values.copy()
+        fc_upper = fc_df_full["yhat_upper"].values.copy()
 
     elif best_name == "lightgbm":
         fit_obj, fc_mw = fit_lightgbm(series, horizon=horizon)
         rmse     = results["lightgbm"]["scores"]["RMSE"]
-        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse)
-        fc_upper = fc_mw + 1.5 * rmse
+        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse).copy()
+        fc_upper = (fc_mw + 1.5 * rmse).copy()
 
     elif best_name == "xgboost":
         fit_obj, fc_mw = fit_xgboost(series, horizon=horizon)
         rmse     = results["xgboost"]["scores"]["RMSE"]
-        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse)
-        fc_upper = fc_mw + 1.5 * rmse
+        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse).copy()
+        fc_upper = (fc_mw + 1.5 * rmse).copy()
 
     elif best_name == "lstm":
-        _, _, fc_mw = fit_lstm(series, horizon=horizon)
+        fit_obj, lstm_scaler, fc_mw = fit_lstm(series, horizon=horizon)
         rmse     = results["lstm"]["scores"]["RMSE"]
-        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse)
-        fc_upper = fc_mw + 1.5 * rmse
+        fc_lower = np.maximum(0, fc_mw - 1.5 * rmse).copy()
+        fc_upper = (fc_mw + 1.5 * rmse).copy()
 
     forecast_df = pd.DataFrame({
         "plant_id":    plant_id,
@@ -852,7 +854,8 @@ def select_best_univariate_model(
         "plant_id":            plant_id,
         "plant_type":          plant_type,
         "best_model":          best_name,
-        "model_object":        fit_obj,
+        "model_object":        fit_obj,       # actual model object
+        "lstm_scaler":         lstm_scaler,   # MinMaxScaler — only set when best_name=="lstm"
         "lstm_triggered":      _run_lstm,
         "diagnostics":         diag,
         "all_scores":          {m: r["scores"] for m, r in results.items()},
@@ -928,11 +931,19 @@ def _process_one_plant(
         model_path = MODEL_DIR / f"{plant_id}_generation_model_{ts}.pkl"
 
 
+        val_rmse    = result["all_scores"][model_name]["RMSE"]
+        lstm_scaler = result.get("lstm_scaler")   # MinMaxScaler for lstm, None otherwise
+
         payload = {
-            "model": model_obj,
-            "plant_id": plant_id,
-            "plant_type": plant_type,
-            "model_name": model_name,
+            "model_name":     model_name,
+            "model":          model_obj,           # call model.predict / model.forecast
+            "lstm_scaler":    lstm_scaler,         # needed to invert LSTM output; None otherwise
+            "plant_id":       plant_id,
+            "plant_type":     plant_type,
+            "horizon":        horizon,
+            "val_rmse":       val_rmse,
+            "last_timestamp": series.index[-1],
+            "last_values":    series.values[-168:].tolist(),  # seed for tree/lstm recursive predict
         }
 
         with open(model_path, "wb") as f:
@@ -989,6 +1000,150 @@ def _process_one_plant(
 # ══════════════════════════════════════════════════════════════════════════
 # FLEET RUNNER — parallelised with joblib
 # ═════════════════════════════════════════════════════════════════════════=
+def predict_generation(
+    pkl_path: str,
+    timestamps,           # pd.DatetimeIndex | pd.Series | list of datetime-like
+    horizon: int = None,  # fallback when timestamps=None
+) -> pd.DataFrame:
+    """
+    Load a saved generation pkl and predict for the given timestamps.
+
+    Each model type is handled correctly:
+      - prophet   : model.predict(future_df)
+      - sarima    : model.forecast(steps)         — only contiguous from training end
+      - ets       : model.forecast(steps)         — only contiguous from training end
+      - theta     : model.forecast(steps)         — only contiguous from training end
+      - lightgbm  : recursive lag-feature predict — works on arbitrary timestamps
+      - xgboost   : recursive lag-feature predict — works on arbitrary timestamps
+      - lstm      : seed from last_values + scaler inverse transform
+
+    Parameters
+    ----------
+    pkl_path   : path to .pkl saved by _process_one_plant
+    timestamps : exact timestamps you want predictions for.
+                 Accepts pd.DatetimeIndex, pd.Series, or list of datetime-like.
+                 If None, builds horizon hours from last_timestamp.
+    horizon    : only used when timestamps=None.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        plant_id, timestamp, forecast_mw, lower_90, upper_90, model
+
+    Example
+    -------
+    ts = pd.date_range("2026-06-01", periods=72, freq="h")
+    df = predict_generation("models/generation/PLANT_001_generation_20260505_1400.pkl", ts)
+
+    # or from a DataFrame column:
+    df = predict_generation(pkl_path, timestamps=my_df["timestamp"])
+    """
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+
+    model_name     = payload["model_name"]
+    model          = payload["model"]
+    lstm_scaler    = payload["lstm_scaler"]
+    plant_id       = payload["plant_id"]
+    val_rmse       = payload["val_rmse"]
+    last_timestamp = payload["last_timestamp"]
+    last_values    = np.array(payload["last_values"])   # last 168 hrs of training series
+
+    # ── Resolve timestamps ────────────────────────────────────────────
+    if timestamps is not None:
+        if isinstance(timestamps, pd.Series):
+            forecast_timestamps = pd.DatetimeIndex(pd.to_datetime(timestamps.values))
+        elif isinstance(timestamps, pd.DatetimeIndex):
+            forecast_timestamps = timestamps
+        else:
+            forecast_timestamps = pd.DatetimeIndex(pd.to_datetime(list(timestamps)))
+    else:
+        h = horizon or payload["horizon"]
+        forecast_timestamps = pd.date_range(
+            start=last_timestamp + pd.Timedelta(hours=1),
+            periods=h,
+            freq="h",
+        )
+
+    n = len(forecast_timestamps)
+
+    # ── Prophet ───────────────────────────────────────────────────────
+    if model_name == "prophet":
+        future   = pd.DataFrame({"ds": forecast_timestamps})
+        fc_df    = model.predict(future)
+        fc_mw    = fc_df["yhat"].clip(lower=0).values.copy()
+        fc_lower = fc_df["yhat_lower"].clip(lower=0).values.copy()
+        fc_upper = fc_df["yhat_upper"].values.copy()
+
+    # ── SARIMA / ETS / Theta — contiguous step-ahead only ────────────
+    elif model_name in ("sarima", "ets", "theta"):
+        # These forecast from training end — forecast far enough to cover requested timestamps
+        hours_from_end = int(
+            (forecast_timestamps[-1] - last_timestamp).total_seconds() / 3600
+        )
+        steps_needed = max(n, hours_from_end)
+
+        if model_name == "sarima":
+            fc_all = np.maximum(0, model.forecast(steps=steps_needed).values)
+        else:
+            fc_all = np.maximum(0, model.forecast(steps_needed))
+
+        # Slice to the requested timestamps by offset
+        start_offset = int((forecast_timestamps[0] - last_timestamp).total_seconds() / 3600) - 1
+        fc_mw    = fc_all[start_offset : start_offset + n].copy()
+        fc_lower = np.maximum(0, fc_mw - 1.5 * val_rmse)
+        fc_upper = (fc_mw + 1.5 * val_rmse).copy()
+
+    # ── LightGBM / XGBoost — recursive lag-feature predict ───────────
+    elif model_name in ("lightgbm", "xgboost"):
+        seed_index = pd.date_range(end=last_timestamp, periods=len(last_values), freq="h")
+        history    = pd.Series(last_values, index=seed_index)
+        feature_cols = None
+
+        fc_mw = []
+        for step in range(n):
+            feat_df = _build_lag_features(history)
+            if feature_cols is None:
+                feature_cols = [c for c in feat_df.columns if c != "y"]
+            x_pred = feat_df[feature_cols].iloc[[-1]].values
+            pred   = max(0.0, float(model.predict(x_pred)[0]))
+            fc_mw.append(pred)
+            next_ts = history.index[-1] + pd.Timedelta(hours=1)
+            history = pd.concat([history, pd.Series([pred], index=[next_ts])])
+
+        fc_mw    = np.array(fc_mw)
+        fc_lower = np.maximum(0, fc_mw - 1.5 * val_rmse)
+        fc_upper = (fc_mw + 1.5 * val_rmse).copy()
+
+    # ── LSTM ──────────────────────────────────────────────────────────
+    elif model_name == "lstm":
+        import torch
+        device      = "cuda" if torch.cuda.is_available() else "cpu"
+        scaled_seed = lstm_scaler.transform(last_values.reshape(-1, 1)).flatten()
+
+        model.eval()
+        with torch.no_grad():
+            seed        = torch.tensor(scaled_seed, dtype=torch.float32)
+            seed        = seed.unsqueeze(0).unsqueeze(-1).to(device)
+            pred_scaled = model(seed).cpu().numpy().flatten()
+
+        fc_mw    = lstm_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
+        fc_mw    = np.maximum(0, fc_mw[:n])
+        fc_lower = np.maximum(0, fc_mw - 1.5 * val_rmse)
+        fc_upper = (fc_mw + 1.5 * val_rmse).copy()
+
+    else:
+        raise ValueError(f"Unknown model_name in pkl: {model_name!r}")
+
+    return pd.DataFrame({
+        "plant_id":    plant_id,
+        "timestamp":   forecast_timestamps,
+        "forecast_mw": np.round(fc_mw,   3),
+        "lower_90":    np.round(fc_lower, 3),
+        "upper_90":    np.round(fc_upper, 3),
+        "model":       model_name,
+    })
+
 
 def run_univariate_fleet(
     fleet_df: pd.DataFrame,

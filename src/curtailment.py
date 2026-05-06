@@ -45,7 +45,7 @@ from sklearn.metrics import (
     f1_score, precision_score, recall_score
 )
 from joblib import Parallel, delayed
-import pickle
+import pickle 
 
 try:
     import lightgbm as lgb
@@ -553,9 +553,13 @@ def apply_curtailment_correction(
 # ══════════════════════════════════════════════════════════════════════
 # SECTION 6 — FLEET RUNNER
 # ══════════════════════════════════════════════════════════════════════
+import joblib
+from pathlib import Path
 from datetime import datetime
 
 MODEL_DIR = Path("models/curtailment")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def _process_curtailment_one_plant(
@@ -572,26 +576,34 @@ def _process_curtailment_one_plant(
         result = forecast_curtailment_one_plant(
             plant_id, plant_df, future_df, val_days
         )
+         # ── Save model ───────────────────────────────
         # ── Save pkl ─────────────────────────────────────────────────
         ts         = datetime.now().strftime("%Y%m%d_%H%M")
         model_path = MODEL_DIR / f"{plant_id}_curtailment_{ts}.pkl"
 
+        # Save last 168 hrs of lag history so predict_curtailment can
+        # reconstruct lag features without needing the full history
+        hist_tail = plant_df.sort_values("timestamp").tail(168)
+
         payload = {
-            "classifier":    result["classifier_model"],  # predict_proba → curtailment probability
-            "regressor":     result["regressor_model"],   # predict → curtailment MW (None = use fallback_mean)
-            "fallback_mean": result["fallback_mean"],     # mean MW used when regressor is None
-            "plant_id":      plant_id,
-            "plant_type":    plant_type,
-            "capacity_mw":   float(capacity_mw),
-            "features":      CURTAILMENT_FEATURES,
+            "classifier":       result["classifier_model"],
+            "regressor":        result["regressor_model"],
+            "fallback_mean":    result["fallback_mean"],
+            "plant_id":         plant_id,
+            "plant_type":       plant_type,
+            "capacity_mw":      float(capacity_mw),
+            "features":         CURTAILMENT_FEATURES,
+            # lag seed — last 168 hrs of curtailment history
+            "hist_curtailed":   hist_tail["curtailed"].values.tolist(),
+            "hist_curt_mw":     hist_tail["curtailment_mw"].values.tolist(),
         }
 
         with open(model_path, "wb") as f:
             pickle.dump(payload, f)
 
-        print(f"    Saved pkl → {model_path.name}")
+        print(f"    Saved pkl -> {model_path.name}")
 
-        # ── Return success result ─────────────────────────────────────
+        # ── Return ────────────────────────────────────────────────────
         return {
             "status":      "ok",
             "plant_id":    plant_id,
@@ -609,24 +621,21 @@ def _process_curtailment_one_plant(
 
 def predict_curtailment(
     pkl_path: str,
-    future_features_df: pd.DataFrame,  # output of build_curtailment_future_features()
+    df: pd.DataFrame,  # needs only: timestamp, forecast_mw, irradiance_forecast
 ) -> pd.DataFrame:
     """
-    Load a saved curtailment pkl and predict for the given future feature rows.
+    Load a saved curtailment pkl and predict from minimal inputs.
 
-    Because curtailment uses lag features (curtailed_lag_1, curtail_rate_24h, etc.)
-    the future features MUST be built with build_curtailment_future_features() —
-    you cannot just pass raw timestamps here.
+    Lag features are reconstructed automatically from the history saved
+    inside the pkl — you do NOT need to pass historical data.
 
     Parameters
     ----------
-    pkl_path           : path to .pkl saved by _process_curtailment_one_plant
-    future_features_df : DataFrame with curtailment feature columns + timestamp.
-                         Build it with:
-                             future_feat = build_curtailment_future_features(
-                                 hist_feat_df, plant_id, plant_fc_df,
-                                 capacity_mw, plant_type,
-                             )
+    pkl_path : path to .pkl saved by _process_curtailment_one_plant
+    df       : DataFrame with at minimum these 3 columns:
+                 - timestamp           : hourly datetime
+                 - forecast_mw         : generation forecast (MW)
+                 - irradiance_forecast : irradiance forecast (W/m²) — or 0 if unavailable
 
     Returns
     -------
@@ -636,33 +645,92 @@ def predict_curtailment(
 
     Example
     -------
-    future_feat = build_curtailment_future_features(
-        hist_feat_df, "PLANT_001", plant_fc_df, capacity_mw=50.0, plant_type="Solar"
-    )
     df = predict_curtailment(
         "models/curtailment/PLANT_001_curtailment_20260505_1400.pkl",
-        future_feat,
+        merged_df[["timestamp", "forecast_mw", "irradiance_forecast"]],
     )
     """
     with open(pkl_path, "rb") as f:
         payload = pickle.load(f)
 
-    clf          = payload["classifier"]
-    reg          = payload["regressor"]
-    fallback_mean= payload["fallback_mean"]
-    plant_id     = payload["plant_id"]
-    feat_cols    = payload["features"]
+    clf            = payload["classifier"]
+    reg            = payload["regressor"]
+    fallback_mean  = payload["fallback_mean"]
+    plant_id       = payload["plant_id"]
+    plant_type     = payload["plant_type"]
+    capacity_mw    = payload["capacity_mw"]
+    feat_cols      = payload["features"]
+    hist_curtailed = np.array(payload.get("hist_curtailed", []))
+    hist_curt_mw   = np.array(payload.get("hist_curt_mw",   []))
 
-    # ── Align feature columns ─────────────────────────────────────────
-    # Fill any missing features with 0 (same fallback as training worker)
-    available = [c for c in feat_cols if c in future_features_df.columns]
-    missing   = set(feat_cols) - set(available)
-    if missing:
-        print(f"[WARN] {plant_id}: filling {len(missing)} missing features with 0: {missing}")
-        for col in missing:
-            future_features_df[col] = 0.0
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
-    X_future = future_features_df[feat_cols].values
+    type_map = {"Solar": 0, "Wind": 1, "Hybrid": 2}
+    rows = []
+
+    for _, row in df.iterrows():
+        ts    = row["timestamp"]
+        fc_mw = float(row.get("forecast_mw", 0))
+        irr   = float(row.get("irradiance_forecast", 0))
+
+        feat = {
+            # ── Time ────────────────────────────────────────────────
+            "hour":          ts.hour,
+            "day_of_week":   ts.dayofweek,
+            "month":         ts.month,
+            "is_weekend":    int(ts.dayofweek >= 5),
+            "is_peak_solar": int(10 <= ts.hour <= 14),
+            "is_monsoon":    int(ts.month in [6, 7, 8, 9]),
+            "hour_sin":      np.sin(2 * np.pi * ts.hour / 24),
+            "hour_cos":      np.cos(2 * np.pi * ts.hour / 24),
+            "month_sin":     np.sin(2 * np.pi * ts.month / 12),
+            "month_cos":     np.cos(2 * np.pi * ts.month / 12),
+            # ── Generation pressure ──────────────────────────────────
+            "gen_pressure":    min(1.2, fc_mw / (capacity_mw + 1e-6)),
+            "irradiance_norm": (
+                min(1.0, irr / 1000) if irr > 0
+                else (np.sin(np.pi * (ts.hour - 6) / 12) if 6 <= ts.hour <= 18 else 0.0)
+            ),
+            # ── Plant type ───────────────────────────────────────────
+            "plant_type_code": type_map.get(plant_type, 0),
+        }
+
+        # ── Lag features ─────────────────────────────────────────────
+        # Combine saved hist tail with predictions made so far this call
+        predicted_curtailed = [r["curtailed_lag_1"] for r in rows]
+        predicted_curt_mw   = [r["curtail_mw_lag_1"] for r in rows]
+        all_curtailed = list(hist_curtailed) + predicted_curtailed
+        all_curt_mw   = list(hist_curt_mw)   + predicted_curt_mw
+
+        for lag in [1, 2, 3, 24, 48, 168]:
+            if lag <= len(all_curtailed):
+                feat[f"curtailed_lag_{lag}"]  = float(all_curtailed[-lag])
+                feat[f"curtail_mw_lag_{lag}"] = float(all_curt_mw[-lag])
+            else:
+                feat[f"curtailed_lag_{lag}"]  = 0.0
+                feat[f"curtail_mw_lag_{lag}"] = 0.0
+
+        # Rolling rates
+        tail_24  = all_curtailed[-24:]  if len(all_curtailed)  >= 24  else all_curtailed
+        tail_168 = all_curtailed[-168:] if len(all_curtailed)  >= 168 else all_curtailed
+        mw_24    = all_curt_mw[-24:]    if len(all_curt_mw)    >= 24  else all_curt_mw
+
+        feat["curtail_rate_24h"]  = float(np.mean(tail_24))  if tail_24  else 0.0
+        feat["curtail_rate_168h"] = float(np.mean(tail_168)) if tail_168 else 0.0
+        feat["curtail_mean_24h"]  = float(np.mean(mw_24))    if mw_24    else 0.0
+
+        rows.append(feat)
+
+    feat_df = pd.DataFrame(rows)
+
+    # Fill any feature the model expects but we didn't build
+    for col in feat_cols:
+        if col not in feat_df.columns:
+            feat_df[col] = 0.0
+
+    X_future = feat_df[feat_cols].values
 
     # ── Stage 1: probability of curtailment ───────────────────────────
     curt_prob = clf.predict_proba(X_future)[:, 1]
@@ -673,15 +741,15 @@ def predict_curtailment(
     else:
         curt_amount = np.full(len(X_future), fallback_mean if fallback_mean else 0.0)
 
-    # ── Combined forecast: E[curtailment] = P(curtail) × amount ──────
+    # ── E[curtailment] = P(curtail) x amount ─────────────────────────
     curt_forecast = curt_prob * curt_amount
 
     return pd.DataFrame({
-        "plant_id":                  plant_id,
-        "timestamp":                 future_features_df["timestamp"].values,
-        "curtailment_mw_forecast":   np.round(curt_forecast, 3),
-        "curtail_probability":       np.round(curt_prob,     3),
-        "curtail_amount_given_event": np.round(curt_amount,  3),
+        "plant_id":                   plant_id,
+        "timestamp":                  df["timestamp"].values,
+        "curtailment_mw_forecast":    np.round(curt_forecast, 3),
+        "curtail_probability":        np.round(curt_prob,     3),
+        "curtail_amount_given_event": np.round(curt_amount,   3),
     })
 
 
