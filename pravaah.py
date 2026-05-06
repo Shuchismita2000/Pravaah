@@ -81,21 +81,21 @@ if page == "📈 Forecast Intelligence":
     # ── Load forecast CSVs ────────────────────────────────────────────────
     @st.cache_data(show_spinner="Loading multivariate forecasts…")
     def load_mv_forecasts():
-        df = pd.read_csv("data/multivariate/solar/multivariate_forecasts.csv", parse_dates=["timestamp"])
+        df = pd.read_csv("data/forecasts/multivariate/solar/multivariate_forecasts.csv", parse_dates=["timestamp"])
         return df
 
     @st.cache_data(show_spinner="Loading scenario simulations…")
     def load_sc_sims():
-        df = pd.read_csv("data/multivariate/solar/scenario_simulations.csv", parse_dates=["timestamp"])
+        df = pd.read_csv("data/forecasts/multivariate/solar/scenario_simulations.csv", parse_dates=["timestamp"])
         return df
 
     @st.cache_data(show_spinner="Loading model selection log…")
     def load_model_log():
-        return pd.read_csv("data/multivariate/solar/model_selection_log.csv")
+        return pd.read_csv("data/forecasts/multivariate/solar/model_selection_log.csv")
 
     @st.cache_data(show_spinner="Loading STL fleet summary…")
     def load_stl_fleet():
-        return pd.read_csv("data/multivariate/stl_fleet_summary.csv")
+        return pd.read_csv("data/forecasts/multivariate/stl_fleet_summary.csv")
 
     mv_fc = load_mv_forecasts()
     sc_sim = load_sc_sims()
