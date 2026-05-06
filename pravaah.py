@@ -57,17 +57,293 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigate",
-        ["🏭 Plant Operations", "🌦️ Weather Report"],
+        ["📈 Forecast Intelligence", "🏭 Plant Operations", "🌦️ Weather Report"],
         label_visibility="collapsed",
     )
     st.divider()
     st.caption("Data: Karnataka RE Portfolio · 50 plants")
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PAGE 0 — FORECAST INTELLIGENCE
+# ════════════════════════════════════════════════════════════════════════════
+if page == "📈 Forecast Intelligence":
+
+    import pandas as pd
+    import plotly.express as px
+    import plotly.graph_objects as go
+    import numpy as np
+
+    st.title("📈 Forecast Intelligence")
+    st.caption("AI-powered generation forecasts · Multivariate models · Probabilistic scenarios")
+
+    # ── Load forecast CSVs ────────────────────────────────────────────────
+    @st.cache_data(show_spinner="Loading multivariate forecasts…")
+    def load_mv_forecasts():
+        df = pd.read_csv("data/multivariate/solar/multivariate_forecasts.csv", parse_dates=["timestamp"])
+        return df
+
+    @st.cache_data(show_spinner="Loading scenario simulations…")
+    def load_sc_sims():
+        df = pd.read_csv("data/multivariate/solar/scenario_simulations.csv", parse_dates=["timestamp"])
+        return df
+
+    @st.cache_data(show_spinner="Loading model selection log…")
+    def load_model_log():
+        return pd.read_csv("data/multivariate/solar/model_selection_log.csv")
+
+    @st.cache_data(show_spinner="Loading STL fleet summary…")
+    def load_stl_fleet():
+        return pd.read_csv("data/multivariate/stl_fleet_summary.csv")
+
+    mv_fc = load_mv_forecasts()
+    sc_sim = load_sc_sims()
+    model_log = load_model_log()
+    stl_fleet = load_stl_fleet()
+
+    # ── Sidebar filters ────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### Forecast Filters")
+        plants_avail = sorted(mv_fc["plant_id"].unique().tolist())
+        sel_plant = st.selectbox("Select Plant", plants_avail)
+        horizon_opts = {"Next 24 hrs": 24, "Next 48 hrs": 48, "Full 72 hrs": 72}
+        sel_horizon_label = st.selectbox("Forecast Horizon", list(horizon_opts.keys()), index=2)
+        sel_horizon = horizon_opts[sel_horizon_label]
+        show_ci = st.checkbox("Show Confidence Bands", value=True)
+
+    pfc = mv_fc[mv_fc["plant_id"] == sel_plant].sort_values("timestamp").head(sel_horizon)
+    psc = sc_sim[sc_sim["plant_id"] == sel_plant].sort_values("timestamp").head(sel_horizon)
+    pml = model_log[model_log["plant_id"] == sel_plant]
+    pstl = stl_fleet[stl_fleet["plant_id"] == sel_plant]
+
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    peak_mw = pfc["forecast_mw"].max() if len(pfc) else 0
+    peak_ts = pfc.loc[pfc["forecast_mw"].idxmax(), "timestamp"].strftime("%d %b %H:%M") if len(pfc) else "—"
+    avg_mw  = pfc["forecast_mw"].mean() if len(pfc) else 0
+    best_model = pml["best_model"].values[0] if len(pml) else "—"
+    best_mape  = pml["ridge_MAPE"].values[0] if len(pml) else 0
+    avg_sigma  = psc["sigma_total"].mean() if len(psc) else 0
+    difficulty = pstl["forecast_difficulty"].values[0] if len(pstl) else "—"
+    fleet_total = mv_fc.groupby("plant_id")["forecast_mw"].sum().sum()
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Peak Forecast", f"{peak_mw:.1f} MW", f"at {peak_ts}")
+    k2.metric("Avg Generation", f"{avg_mw:.2f} MW", "per hour")
+    k3.metric("Best Model MAPE", f"{best_mape:.2f}%", best_model)
+    k4.metric("Uncertainty (σ)", f"{avg_sigma:.2f}", "avg sigma_total")
+    k5.metric("Fleet Total (72h)", f"{fleet_total:.0f} MWh", "all plants")
+    st.divider()
+
+    # ── Row 1: Forecast chart + Confidence ────────────────────────────────
+    col_main, col_conf = st.columns([3, 1])
+
+    with col_main:
+        st.markdown('<div class="section-header">Generation Forecast — ' + sel_plant + '</div>', unsafe_allow_html=True)
+        fig_fc = go.Figure()
+        if show_ci:
+            fig_fc.add_trace(go.Scatter(
+                x=pfc["timestamp"], y=pfc["upper_90"],
+                mode="lines", line=dict(width=0), name="Upper 90%", showlegend=False,
+            ))
+            fig_fc.add_trace(go.Scatter(
+                x=pfc["timestamp"], y=pfc["lower_90"],
+                mode="lines", line=dict(width=0),
+                fill="tonexty", fillcolor="rgba(26,109,255,0.12)", name="90% CI",
+            ))
+        fig_fc.add_trace(go.Scatter(
+            x=pfc["timestamp"], y=pfc["forecast_mw"],
+            mode="lines", line=dict(color="#1a6dff", width=2.5), name="Forecast MW",
+        ))
+        if show_ci and len(psc):
+            fig_fc.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p90"],
+                mode="lines", line=dict(color="rgba(86,217,160,0.5)", dash="dot", width=1),
+                name="P90 Optimistic",
+            ))
+            fig_fc.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p10"],
+                mode="lines", line=dict(color="rgba(255,95,95,0.5)", dash="dot", width=1),
+                name="P10 Conservative",
+            ))
+        fig_fc.update_layout(
+            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            height=320, margin=dict(t=10, b=10), legend=dict(orientation="h", y=-0.15),
+            xaxis_title="", yaxis_title="Generation (MW)",
+        )
+        st.plotly_chart(fig_fc, width='stretch')
+
+    with col_conf:
+        st.markdown('<div class="section-header">Confidence</div>', unsafe_allow_html=True)
+        if len(psc):
+            avg_mw_sc = psc["forecast_mw"].mean()
+            avg_sigma_sc = psc["sigma_total"].mean()
+            cv = avg_sigma_sc / (avg_mw_sc + 1e-9)
+            conf = max(0, min(100, int((1 - cv * 0.5) * 100)))
+            p10_avg = psc["p10"].mean()
+            p90_avg = psc["p90"].mean()
+            sc_worst = psc["scenario_worst"].mean()
+            sc_base  = psc["scenario_base"].mean()
+            sc_best  = psc["scenario_best"].mean()
+        else:
+            conf = 0; p10_avg = p90_avg = sc_worst = sc_base = sc_best = 0
+        st.metric("Confidence Score", f"{conf}%")
+        st.metric("P10–P90 Range", f"{p10_avg:.1f}–{p90_avg:.1f} MW")
+        st.divider()
+        c1b, c2b, c3b = st.columns(3)
+        c1b.metric("⬇️ Worst", f"{sc_worst:.1f}")
+        c2b.metric("📊 Base", f"{sc_base:.1f}")
+        c3b.metric("⬆️ Best", f"{sc_best:.1f}")
+        diff_colors = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}
+        st.info(f"{diff_colors.get(difficulty, '⚪')} **{difficulty.upper()}** forecast difficulty")
+
+    # ── Row 2: Scenario fan + Model bar ───────────────────────────────────
+    col_fan, col_mod = st.columns(2)
+
+    with col_fan:
+        st.markdown('<div class="section-header">Scenario Fan Chart (P10–P90)</div>', unsafe_allow_html=True)
+        if len(psc):
+            fig_fan = go.Figure()
+            fig_fan.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p90"],
+                mode="lines", line=dict(color="#56d9a0", width=1),
+                fill="tozeroy", fillcolor="rgba(86,217,160,0.08)", name="P90",
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p75"],
+                mode="lines", line=dict(color="#4fc3f7", width=1),
+                fill="tozeroy", fillcolor="rgba(79,195,247,0.08)", name="P75",
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p50"],
+                mode="lines", line=dict(color="#1a6dff", width=2.5),
+                fill="tozeroy", fillcolor="rgba(26,109,255,0.1)", name="P50",
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p25"],
+                mode="lines", line=dict(color="#f5a623", width=1),
+                fill="tozeroy", fillcolor="rgba(245,166,35,0.06)", name="P25",
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=psc["timestamp"], y=psc["p10"],
+                mode="lines", line=dict(color="#ff5f5f", width=1),
+                fill="tozeroy", fillcolor="rgba(255,95,95,0.05)", name="P10",
+            ))
+            fig_fan.update_layout(
+                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                height=280, margin=dict(t=5, b=5), legend=dict(orientation="h", y=-0.2),
+                yaxis_title="MW",
+            )
+            st.plotly_chart(fig_fan, width='stretch')
+
+    with col_mod:
+        st.markdown('<div class="section-header">Model Performance Comparison</div>', unsafe_allow_html=True)
+        if len(pml):
+            row = pml.iloc[0]
+            model_df = pd.DataFrame({
+                "Model": ["Ridge", "LightGBM", "XGBoost", "SVR"],
+                "MAE (MW)": [row["ridge_MAE"], row["lightgbm_MAE"], row["xgboost_MAE"], row["svr_MAE"]],
+                "MAPE (%)": [row["ridge_MAPE"], row["lightgbm_MAPE"], row["xgboost_MAPE"], row["svr_MAPE"]],
+            })
+            fig_mod = px.bar(
+                model_df, x="Model", y="MAE (MW)", color="Model",
+                color_discrete_map={"Ridge": "#a78bfa", "LightGBM": "#34d399", "XGBoost": "#f87171", "SVR": "#fbbf24"},
+                template="plotly_dark", text="MAPE (%)",
+            )
+            fig_mod.update_traces(texttemplate="%{text:.2f}% MAPE", textposition="outside")
+            fig_mod.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                height=200, margin=dict(t=5, b=5), showlegend=False,
+            )
+            st.plotly_chart(fig_mod, width='stretch')
+            st.dataframe(model_df, width='stretch', hide_index=True, height=110)
+
+    # ── Row 3: STL + Daily summary ─────────────────────────────────────────
+    col_stl, col_daily = st.columns(2)
+
+    with col_stl:
+        st.markdown('<div class="section-header">Signal Decomposition (STL)</div>', unsafe_allow_html=True)
+        if len(pstl):
+            s = pstl.iloc[0]
+            stl_df = pd.DataFrame({
+                "Component": ["Seasonal", "Weekly", "Trend"],
+                "Strength": [s["seasonal_strength"], s["weekly_strength"], s["trend_strength"]],
+            })
+            fig_stl = px.bar(
+                stl_df, x="Component", y="Strength", color="Component",
+                color_discrete_map={"Seasonal": "#f5a623", "Weekly": "#4fc3f7", "Trend": "#a78bfa"},
+                template="plotly_dark",
+            )
+            fig_stl.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                height=220, margin=dict(t=5, b=5), showlegend=False, yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_stl, width='stretch')
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Residual Std", f"{s['residual_std']:.2f} MW")
+            m2.metric("Dominant Period", s["dominant_period"].capitalize())
+            m3.metric("Difficulty", s["forecast_difficulty"].upper())
+
+    with col_daily:
+        st.markdown('<div class="section-header">Daily Generation Summary</div>', unsafe_allow_html=True)
+        if len(psc):
+            psc_copy = psc.copy()
+            psc_copy["date"] = psc_copy["timestamp"].dt.date
+            day_grp = psc_copy.groupby("date").agg(
+                worst=("scenario_worst", "sum"),
+                base=("scenario_base", "sum"),
+                best=("scenario_best", "sum"),
+            ).reset_index()
+            fig_daily = go.Figure()
+            for col_n, color_h, lbl in [("best", "rgba(86,217,160,0.7)", "Best"), ("base", "rgba(26,109,255,0.6)", "Base"), ("worst", "rgba(255,95,95,0.5)", "Worst")]:
+                fig_daily.add_trace(go.Bar(x=day_grp["date"].astype(str), y=day_grp[col_n], name=lbl, marker_color=color_h))
+            fig_daily.update_layout(
+                barmode="group", template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                height=280, margin=dict(t=5, b=5), legend=dict(orientation="h", y=-0.2),
+                yaxis_title="MWh",
+            )
+            st.plotly_chart(fig_daily, width='stretch')
+
+    # ── Fleet overview ──────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Fleet Overview — All Forecast Plants</div>', unsafe_allow_html=True)
+    fleet_summ = mv_fc.groupby("plant_id").agg(
+        peak_mw=("forecast_mw", "max"),
+        avg_mw=("forecast_mw", "mean"),
+        total_mwh=("forecast_mw", "sum"),
+    ).reset_index()
+    fleet_summ = fleet_summ.merge(
+        model_log[["plant_id", "best_model", "ridge_MAPE", "forecast_difficulty"]], on="plant_id", how="left"
+    )
+    fig_fleet = px.bar(
+        fleet_summ.sort_values("total_mwh", ascending=False),
+        x="plant_id", y="total_mwh", color="forecast_difficulty",
+        color_discrete_map={"easy": "#56d9a0", "medium": "#f5a623", "hard": "#ff5f5f"},
+        hover_data={"peak_mw": ":.1f", "avg_mw": ":.2f", "ridge_MAPE": ":.2f", "best_model": True},
+        template="plotly_dark",
+        labels={"total_mwh": "Total MWh (72h)", "plant_id": "Plant"},
+    )
+    fig_fleet.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=260, margin=dict(t=5, b=5), legend_title="Difficulty",
+        xaxis=dict(tickangle=-30),
+    )
+    st.plotly_chart(fig_fleet, width='stretch')
+
+    with st.expander("📋 Full Fleet Forecast Table"):
+        st.dataframe(
+            fleet_summ.rename(columns={
+                "plant_id": "Plant", "peak_mw": "Peak MW", "avg_mw": "Avg MW",
+                "total_mwh": "Total MWh", "best_model": "Best Model",
+                "ridge_MAPE": "MAPE (%)", "forecast_difficulty": "Difficulty",
+            }),
+            width='stretch', hide_index=True,
+        )
+
 # ════════════════════════════════════════════════════════════════════════════
 #  PAGE 1 — PLANT OPERATIONS
 # ════════════════════════════════════════════════════════════════════════════
-if page == "🏭 Plant Operations":
+elif page == "🏭 Plant Operations":
 
     import pandas as pd
     import plotly.express as px
@@ -180,7 +456,7 @@ if page == "🏭 Plant Operations":
             legend_title="", paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)", height=280, margin=dict(t=10, b=10),
         )
-        st.plotly_chart(fig_trend, use_container_width=True)
+        st.plotly_chart(fig_trend, width='stretch')
 
     with col_right:
         st.markdown('<div class="section-header">Capacity by Type</div>', unsafe_allow_html=True)
@@ -195,7 +471,7 @@ if page == "🏭 Plant Operations":
             paper_bgcolor="rgba(0,0,0,0)", height=280,
             margin=dict(t=10, b=10), legend_title="",
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width='stretch')
 
     # ── Row 2: Health heatmap + Curtailment bar ───────────────────────────────
     col_a, col_b = st.columns([2, 3])
@@ -227,7 +503,7 @@ if page == "🏭 Plant Operations":
             xaxis=dict(range=[0, 1.05]),
             yaxis=dict(tickfont=dict(size=9)),
         )
-        st.plotly_chart(fig_health, use_container_width=True)
+        st.plotly_chart(fig_health, width='stretch')
 
     with col_b:
         st.markdown('<div class="section-header">Top 10 Plants by Generation</div>', unsafe_allow_html=True)
@@ -250,7 +526,7 @@ if page == "🏭 Plant Operations":
             height=340, margin=dict(t=5, b=5), legend_title="",
             xaxis=dict(tickangle=-30, tickfont=dict(size=9)),
         )
-        st.plotly_chart(fig_top, use_container_width=True)
+        st.plotly_chart(fig_top, width='stretch')
 
     # ── Row 3: Map + Lifecycle events ────────────────────────────────────────
     col_m, col_e = st.columns([3, 2])
@@ -277,7 +553,7 @@ if page == "🏭 Plant Operations":
             paper_bgcolor="rgba(0,0,0,0)", height=380,
             margin=dict(t=0, b=0, l=0, r=0), legend_title="",
         )
-        st.plotly_chart(fig_map, use_container_width=True)
+        st.plotly_chart(fig_map, width='stretch')
 
     with col_e:
         st.markdown('<div class="section-header">Lifecycle Events</div>', unsafe_allow_html=True)
@@ -296,7 +572,7 @@ if page == "🏭 Plant Operations":
                     "event_type": "Event", "health_after": "Health After",
                     "health_boost": "Boost", "notes": "Notes"
                 }),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 height=340,
             )
@@ -317,13 +593,13 @@ if page == "🏭 Plant Operations":
             height=280, margin=dict(t=5, b=5), legend_title="Plant",
             legend=dict(font=dict(size=8)),
         )
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.plotly_chart(fig_scatter, width='stretch')
     else:
         st.info("No solar data for this filter combination.")
 
     # ── Raw table ────────────────────────────────────────────────────────────
     with st.expander("📋 Plant Master Table"):
-        st.dataframe(fp, use_container_width=True, hide_index=True)
+        st.dataframe(fp, width='stretch', hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -502,7 +778,7 @@ elif page == "🌦️ Weather Report":
             margin=dict(t=10, b=10), legend=dict(orientation="h"),
             xaxis_title="", yaxis_title="Temperature (°C)",
         )
-        st.plotly_chart(fig_temp, use_container_width=True)
+        st.plotly_chart(fig_temp, width='stretch')
 
         # ── Precipitation + Solar radiation ────────────────────────────────
         col_p, col_s = st.columns(2)
@@ -523,7 +799,7 @@ elif page == "🌦️ Weather Report":
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 height=240, margin=dict(t=5, b=5), legend_title="",
             )
-            st.plotly_chart(fig_rain, use_container_width=True)
+            st.plotly_chart(fig_rain, width='stretch')
 
         with col_s:
             st.markdown('<div class="section-header">Solar Radiation (Historical + Forecast)</div>', unsafe_allow_html=True)
@@ -541,7 +817,7 @@ elif page == "🌦️ Weather Report":
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 height=240, margin=dict(t=5, b=5), legend_title="",
             )
-            st.plotly_chart(fig_rad, use_container_width=True)
+            st.plotly_chart(fig_rad, width='stretch')
 
         # ── Hourly forecast (next 48h) ─────────────────────────────────────
         st.markdown('<div class="section-header">Hourly Forecast — Next 48 Hours</div>', unsafe_allow_html=True)
@@ -569,7 +845,7 @@ elif page == "🌦️ Weather Report":
             yaxis=dict(title="Temp (°C)", side="left"),
             yaxis2=dict(title="Rain (mm)", overlaying="y", side="right"),
         )
-        st.plotly_chart(fig_h, use_container_width=True)
+        st.plotly_chart(fig_h, width='stretch')
 
         # ── Wind speed timeline ────────────────────────────────────────────
         st.markdown('<div class="section-header">Wind Speed (Historical + Forecast Max)</div>', unsafe_allow_html=True)
@@ -587,7 +863,7 @@ elif page == "🌦️ Weather Report":
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             height=220, margin=dict(t=5, b=5), legend_title="",
         )
-        st.plotly_chart(fig_wind, use_container_width=True)
+        st.plotly_chart(fig_wind, width='stretch')
 
         # ── Data table ────────────────────────────────────────────────────
         with st.expander("📋 Raw forecast data"):
@@ -598,6 +874,6 @@ elif page == "🌦️ Weather Report":
                 "windspeed_10m_max": "Max Wind (km/h)",
                 "shortwave_radiation_sum": "Solar Rad (MJ/m²)",
                 "weather_code": "WMO Code",
-            }), use_container_width=True, hide_index=True)
+            }), width='stretch', hide_index=True)
 
         st.caption("Data: Open-Meteo.com — Free, no API key · Updated hourly · Timezone: Asia/Kolkata")
