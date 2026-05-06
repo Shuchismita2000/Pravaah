@@ -304,7 +304,10 @@ git clone https://github.com/Shuchismita2000/pravah.git
   
 # Install dependencies  
 pip install -r requirements.txt  
-  
+
+# Model Training 
+run model_training.ipynb [unzip generation.csv]
+
 # Run app  
 streamlit run app.py
 

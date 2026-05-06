@@ -366,8 +366,7 @@ elif page == "🏭 Plant Operations":
 
     @st.cache_data(show_spinner="Loading generation data (this may take a moment)…")
     def load_generation():
-        df = pd.read_csv(
-            r"https://drive.google.com/file/d/1ghjKj4QxE2RvK7I5YA-K7QoX8e9jZyUm/view?usp=drive_link",
+        df = pd.read_csv('https://drive.google.com/uc?id=1ghjKj4QxE2RvK7I5YA-K7QoX8e9jZyUm',
             parse_dates=["timestamp"],
             dtype={"plant_id": "category", "plant_type": "category",
                    "region": "category", "status": "category"},
