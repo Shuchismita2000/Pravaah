@@ -29,24 +29,157 @@ This project is built as part of a **hackathon prototype**, focusing on scalabil
 
 PRAVAAH uses a **two-layer forecasting architecture**:
 
-### 1. Univariate Forecasting Layer
+#  1. High-Level Architecture
 
-- Stabilizes individual signals like:
-    - Weather parameters (temperature, wind speed, irradiance)
-    - Past energy generation
-- Models used:
-    - Holt-Winters
-    - SARIMA
-    - Prophet
-    - N-BEATS
+Think in **3 layers**:
 
-###  2. Multivariate Modeling Layer
+### **(A) Data Layer**
 
-- Combines:
-    - Weather forecasts
-    - Historical generation
-    - Plant metadata
-- Captures **non-linear relationships** between weather and power output
+- Sources:
+    
+    - Weather API (irradiance, temp, wind, etc.)
+        
+    - Historical plant data (curtailment, availability, health factor)
+        
+- Storage:
+    
+    - Raw → Data Lake (S3 / Blob / local)
+        
+    - Processed → Feature store (Parquet / DB)
+        
+
+---
+
+### **(B) Feature + Forecast Layer**
+
+You have **two stages**:
+
+## Stage 1: Univariate Forecasts
+
+Forecast individually:
+
+- Irradiance (weather-driven)
+    
+- Curtailment
+    
+- Availability
+    
+- Health factor
+
+---
+
+## Stage 2: Multivariate Forecast
+
+Use:
+
+- Forecasted values (from Stage 1)
+    
+- Weather inputs
+    
+
+Output:
+
+- Final target (likely power generation or yield)
+    
+
+---
+
+### **(C) Serving Layer**
+
+- Pipeline runs every hour (or daily)
+    
+- Uses:
+    
+    - Latest weather forecast
+        
+    - Latest observed plant data
+        
+- Outputs:
+    
+    - Next **24h high-confidence forecast**
+        
+    - Optional: 72h extended forecast
+        
+
+---
+
+#  2. Pipeline Flow (Important)
+
+```
+                ┌──────────────┐
+                │ Weather API  │
+                └──────┬───────┘
+                       │
+                ┌──────▼───────┐
+                │ Data Ingest  │
+                └──────┬───────┘
+                       │
+                ┌──────▼─────────────┐
+                │ Feature Engineering│
+                └──────┬─────────────┘
+                       │
+     ┌─────────────────▼─────────────────┐
+     │ Stage 1: Individual Forecasts     │
+     │ (irradiance, health, etc.)        │
+     └─────────────────┬─────────────────┘
+                       │
+                ┌──────▼─────────────┐
+                │ Combine Features   │
+                └──────┬─────────────┘
+                       │
+     ┌─────────────────▼─────────────────┐
+     │ Stage 2: Multivariate Model       │
+     └─────────────────┬─────────────────┘
+                       │
+                ┌──────▼─────────────┐
+                │ 24h Forecast Output│
+                └────────────────────┘
+```
+
+---
+
+#  3. Key Design Decisions
+
+###  Why 24h rolling forecast?
+
+- Weather accuracy drops after 24h
+    
+- So:
+    
+    - Train for 72h
+        
+    - Serve only 24h (high confidence)
+        
+
+---
+
+###  Strategy: Sliding Window Inference
+
+Every run:
+
+- Take latest data
+    
+- Predict next 24h
+    
+- Discard older predictions
+    
+
+---
+
+#  4. Model Storage Strategy
+
+use `.pkl` (plant wise) (good for now)
+
+Store:
+
+```bash
+models/ 
+  irradiance.pkl
+  curtailment.pkl
+  availability.pkl
+  health.pkl
+  final_multivariate.pkl
+```
 
 ###  3. Decision Intelligence Layer
 
@@ -88,9 +221,32 @@ We created a **realistic synthetic dataset** to simulate real-world conditions:
 - `weather_data`
 - `generation_data`
 
+##  Project Structure
+
+```bash
+forecasting_pipeline/
+│
+├── data/
+│   ├── forecasts/
+│        ├── Availability, Irradiance, Health Factor, Curtailment, Generation_Univariate
+│        ├── multivariate 
+│           ├── Solar/Wind/Hybrid
+│               ├── multivariate_forecast, model_selection_log, scenario_simulation
+│           ├── stl_fleet_summary
+├── models/
+├── src/
+│   ├── Availability, Irradiance, Health Factor, Curtailment, Generation_Univariate
+│   ├── features.py
+│   ├── preprocessing.py
+│   ├── multivariate.py
+├── pravaah.py
+```
+
 ##  Web Application (Prototype)
 
 A **Streamlit-based interactive dashboard** is built to demonstrate:
+https://pravaah-renewable-energy.onrender.com/
+
 
 ### Features:
 
