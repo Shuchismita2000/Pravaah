@@ -246,7 +246,7 @@ forecasting_pipeline/
 
 A **Streamlit-based interactive dashboard** is built to demonstrate:
 https://pravaah-renewable-energy.onrender.com/
-
+And this UI is built to demonstrate our long-term vision, which we can consider as bench-mark to achieve: https://pravah-grid-vision.lovable.app/
 
 ### Features:
 
