@@ -29,11 +29,11 @@ This project is built as part of a **hackathon prototype**, focusing on scalabil
 
 PRAVAAH uses a **two-layer forecasting architecture**:
 
-#  1. High-Level Architecture
+###  1. High-Level Architecture
 
 Think in **3 layers**:
 
-### **(A) Data Layer**
+#### **(A) Data Layer**
 
 - Sources:
     
@@ -50,11 +50,11 @@ Think in **3 layers**:
 
 ---
 
-### **(B) Feature + Forecast Layer**
+#### **(B) Feature + Forecast Layer**
 
 You have **two stages**:
 
-## Stage 1: Univariate Forecasts
+### Stage 1: Univariate Forecasts
 
 Forecast individually:
 
@@ -68,7 +68,7 @@ Forecast individually:
 
 ---
 
-## Stage 2: Multivariate Forecast
+### Stage 2: Multivariate Forecast
 
 Use:
 
@@ -84,7 +84,7 @@ Output:
 
 ---
 
-### **(C) Serving Layer**
+#### **(C) Serving Layer**
 
 - Pipeline runs every hour (or daily)
     
@@ -103,7 +103,7 @@ Output:
 
 ---
 
-#  2. Pipeline Flow (Important)
+##  2. Pipeline Flow (Important)
 
 ```
                 ┌──────────────┐
@@ -138,9 +138,9 @@ Output:
 
 ---
 
-#  3. Key Design Decisions
+##  3. Key Design Decisions
 
-###  Why 24h rolling forecast?
+####  Why 24h rolling forecast?
 
 - Weather accuracy drops after 24h
     
@@ -153,7 +153,7 @@ Output:
 
 ---
 
-###  Strategy: Sliding Window Inference
+####  Strategy: Sliding Window Inference
 
 Every run:
 
@@ -166,7 +166,7 @@ Every run:
 
 ---
 
-#  4. Model Storage Strategy
+##  4. Model Storage Strategy
 
 use `.pkl` (plant wise) (good for now)
 
@@ -181,30 +181,30 @@ models/
   final_multivariate.pkl
 ```
 
-###  3. Decision Intelligence Layer
+####  3. Decision Intelligence Layer
 
 - Generates:
     - Final power forecasts 
     - Confidence intervals 
     - Key drivers of prediction 
 
-##  System Architecture
+###  System Architecture
 
 The system is designed as a modular pipeline:
 
 Data Sources → Data Processing → Univariate Models → Multivariate Model → Forecast Output → Dashboard
 
-### Data Sources:
+#### Data Sources:
 
 -  Weather API (real-time + forecast)
 -  Historical generation data
 -  Plant metadata
 
-##  Dataset
+###  Dataset
 
 We created a **realistic synthetic dataset** to simulate real-world conditions:
 
-### Includes:
+#### Includes:
 
 - 50 power plants:
     - Solar
@@ -215,13 +215,13 @@ We created a **realistic synthetic dataset** to simulate real-world conditions:
     - Power generation
 - Forecast-ready structure
 
-### Key Tables:
+#### Key Tables:
 
 - `plant_master_data`
 - `weather_data`
 - `generation_data`
 
-##  Project Structure
+###  Project Structure
 
 ```bash
 forecasting_pipeline/
