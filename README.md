@@ -226,20 +226,29 @@ We created a **realistic synthetic dataset** to simulate real-world conditions:
 ```bash
 forecasting_pipeline/
 │
-├── data/
+├── data/ (.csv)
 │   ├── forecasts/
 │        ├── Availability, Irradiance, Health Factor, Curtailment, Generation_Univariate
 │        ├── multivariate 
 │           ├── Solar/Wind/Hybrid
 │               ├── multivariate_forecast, model_selection_log, scenario_simulation
 │           ├── stl_fleet_summary
+│   ├── generation
+│   ├── plant_master
+│   ├── lifecycle_event
+│   ├── weather_historical
+│   ├── weather_forecast
 ├── models/
+│   ├──  Availability, Irradiance, Health Factor, Curtailment, Generation_Univariate (.pkl) (Plant_ID wise)
 ├── src/
-│   ├── Availability, Irradiance, Health Factor, Curtailment, Generation_Univariate
+│   ├── Availability, Irradiance, Health Factor, Curtailment, Generation_Univariate (.py)
 │   ├── features.py
 │   ├── preprocessing.py
 │   ├── multivariate.py
 ├── pravaah.py
+├── requirements.txt
+├── model_training.ipynb
+├── inference_pipeline.ipynb
 ```
 
 ##  Web Application (Prototype)
