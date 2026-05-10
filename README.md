@@ -48,8 +48,6 @@ Think in **3 layers**:
     - Processed → Feature store (Parquet / DB)
         
 
----
-
 #### **(B) Feature + Forecast Layer**
 
 You have **two stages**:
@@ -66,8 +64,6 @@ Forecast individually:
     
 - Health factor
 
----
-
 ### Stage 2: Multivariate Forecast
 
 Use:
@@ -81,8 +77,6 @@ Output:
 
 - Final target (likely power generation or yield)
     
-
----
 
 #### **(C) Serving Layer**
 
@@ -101,7 +95,6 @@ Output:
     - Optional: 72h extended forecast
         
 
----
 
 ##  2. Pipeline Flow (Important)
 
@@ -136,8 +129,6 @@ Output:
                 └────────────────────┘
 ```
 
----
-
 ##  3. Key Design Decisions
 
 ####  Why 24h rolling forecast?
@@ -151,7 +142,6 @@ Output:
     - Serve only 24h (high confidence)
         
 
----
 
 ####  Strategy: Sliding Window Inference
 
@@ -163,8 +153,6 @@ Every run:
     
 - Discard older predictions
     
-
----
 
 ##  4. Model Storage Strategy
 
@@ -292,19 +280,7 @@ And this UI is built to demonstrate our long-term vision, which we can consider 
 -  Advanced deep learning models
 -  Grid optimization layer
 -  Cloud deployment
--  Real-time API integration
-
-## Team HuMachine 
-1. Shuchismita Mallick           
-2. Surya Vanshi Sah              
-
-## AI FOR BHARAT Hackathon Submission
-
-This project is developed as part of the **hackathon**, focusing on:
-
-- Innovation 
-- Practical feasibility 
-- Real-world impact 
+-  Real-time API integration              
 
 ##  How to Run
 
@@ -320,9 +296,3 @@ run model_training.ipynb [unzip generation.csv]
 # Run app  
 streamlit run app.py
 
----
-
-## 📜 License
-
-This project is currently for **hackathon and educational purposes**.  
-Dataset is **synthetic**.
